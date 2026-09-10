@@ -18,7 +18,7 @@ Two halves that fill each other's gaps:
 
 **tmux must win backend detection whenever `$TMUX` is set.** Inside kitty running tmux,
 `kitty @ get-text` returns tmux's *rendered viewport*, not the shell's scrollback, and tmux
-swallows the OSC 133 prompt marks that kitty's `last_cmd_output` depends on. Asking kitty
+swallows the OSC 133 prompt marks that kitty's output extents depend on. Asking kitty
 there returns plausible but wrong text. Order lives in `backend::detect`.
 
 **Scrollback coordinates are absolute, never pane-relative.** `capture-pane -S/-E` are
@@ -45,7 +45,7 @@ it, tcap installs its own trap. Both branches are covered by
 **Command text reaches the binary as a single argv element**, so quoting, backslashes and
 newlines need no escaping.
 
-**Only tmux can reach past the most recent command.** kitty exposes a `last_cmd_output`
+**Only tmux can reach past the most recent command.** kitty exposes a latest-output
 extent and nothing older; iTerm2 exposes only its latest prompt. `-c 2` on those must fail
 with a pointer to tmux, never return the wrong block.
 
@@ -61,7 +61,7 @@ socket-only` only the socket works, so the error must advise `listen_on`, not
 ## Verification status
 
 - **tmux** — fully working, covered by end-to-end tests.
-- **kitty** — implemented against `--extent=last_cmd_output`, verified present in kitty 0.48.2.
+- **kitty** — implemented against `--extent=last_non_empty_output`, verified live in kitty 0.48.2.
 - **iTerm2** — written to the documented Python API but **never run**; iTerm2 was not
   installed on the machine it was written on. Treat as unverified.
 - **WezTerm** — detection only. Deliberately not implemented: there is no verified way to map

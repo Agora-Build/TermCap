@@ -130,7 +130,13 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     println!("{text}");
 
     if !settings.quiet {
-        emit_hints(&caps, backend.as_ref(), mode);
+        // Unfiltered: nth_from_end skips tcap invocations, but for this warning
+        // we need to know whether tcap itself ran most recently.
+        let after_tcap = records
+            .last()
+            .map(|r| state::is_tcap_invocation(&r.command))
+            .unwrap_or(false);
+        emit_hints(&caps, backend.as_ref(), mode, after_tcap);
     }
 
     if settings.copy {
@@ -142,7 +148,20 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
 
 /// Warn about degraded captures, naming the cause and the fix. Goes to stderr
 /// so `tcap | sgpt` still pipes clean text.
-fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) {
+fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode, after_tcap: bool) {
+    // Backends without real command boundaries return the last *non-empty*
+    // output. tcap's own output is non-empty, so a capture straight after
+    // another one hands back the previous capture rather than a command.
+    if after_tcap && !backend.supports_history() {
+        eprintln!(
+            "tcap: the previous command was tcap itself, and {} can only report the\n\
+             \x20 last non-empty output — so this is probably tcap's own output rather\n\
+             \x20 than a command's. Re-run the command you meant to capture, or use\n\
+             \x20 tmux, which records exact boundaries.",
+            backend.name()
+        );
+    }
+
     // Only the annotated view promises metadata, so only it can disappoint.
     if mode != cli::Mode::Annotated {
         return;

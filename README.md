@@ -140,7 +140,7 @@ Norway problem, where `quiet: no` silently parses as `false`.
 | Terminal | Last command | Older commands (`-c 2`) | Notes |
 |---|---|---|---|
 | **tmux** | yes | **yes** | The only backend that can reach back |
-| **kitty** | yes | no | Needs `allow_remote_control yes` |
+| **kitty** | yes | no | Needs remote control (`yes`, or `socket-only` + `listen_on`) |
 | **iTerm2** | yes | no | Needs Shell Integration + `pip install iterm2` |
 | **WezTerm** | not yet | no | Detected; run inside tmux |
 | Ghostty, Terminal.app, Alacritty | no | no | No remote-control API — run inside tmux |
@@ -149,7 +149,7 @@ Two things worth knowing:
 
 **tmux wins whenever it is running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's *rendered viewport*, not the shell's real history —
-and tmux swallows the prompt marks kitty's `last_cmd_output` depends on. So tmux
+and tmux swallows the prompt marks kitty's output extents depend on. So tmux
 is always treated as authoritative when it is in the stack.
 
 **Only tmux can reach past the most recent command.** kitty exposes only the
@@ -160,8 +160,10 @@ wrong block.
 **On kitty, output is the last *non-empty* output.** kitty counts the running
 `tcap` as the current command, so it has to be asked for the last output that
 wasn't empty. The consequence: if your last command printed nothing, kitty
-returns an *older* command's output while the header names the last one. tmux has
-no such ambiguity, because the shell hook records real boundaries. kitty also
+returns an *older* command's output while the header names the last one — and two
+`tcap` runs in a row return the first run's own output, since that was the last
+thing to print. tcap warns on stderr when it can tell. tmux has no such
+ambiguity, because the shell hook records real boundaries. kitty also
 needs remote control reachable — either `allow_remote_control yes`, or
 `socket-only` together with `listen_on unix:/tmp/kitty-{kitty_pid}`.
 
@@ -197,7 +199,7 @@ under scrolling: as lines scroll off, `history_size` grows by exactly as much as
 ## Development
 
 ```sh
-cargo test                       # 49 unit + 11 end-to-end tests
+cargo test                       # 54 unit + 11 end-to-end tests
 git config core.hooksPath .githooks   # run fmt, clippy and tests before every push
 ```
 

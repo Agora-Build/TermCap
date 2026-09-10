@@ -118,23 +118,72 @@ impl Kitty {
                 .to_string();
         }
 
-        "kitty remote control appears to be disabled. In ~/.config/kitty/kitty.conf \
-         either:\n  allow_remote_control yes\nor keep it restricted and give tcap a \
-         socket:\n  allow_remote_control socket-only\n  listen_on unix:/tmp/kitty-{kitty_pid}\n\
-         Then restart kitty."
+        "If this is a remote-control problem, kitty needs it enabled. In \
+         ~/.config/kitty/kitty.conf either:\n  allow_remote_control yes\nor keep it \
+         restricted and give tcap a socket:\n  allow_remote_control socket-only\n  \
+         listen_on unix:/tmp/kitty-{kitty_pid}\nThen restart kitty. If the message above \
+         says something else, that is the real cause."
             .to_string()
     }
 
     /// `--match id:N` for the window tcap is running in.
     ///
     /// Without it kitty reads whichever window is *focused*, which is not
-    /// necessarily this one — a capture triggered from a script, or with focus
-    /// on another split, silently returns another window's text.
+    /// necessarily this one — a capture from a script, or with focus on another
+    /// split, returns that window's text instead. Callers must treat `None` as
+    /// fatal rather than omitting the flag: the fallback would put another
+    /// pane's scrollback, secrets included, under this command's header.
+    ///
+    /// The id is parsed as a number so a poisoned variable cannot widen the
+    /// match expression, and so a malformed one is reported as such instead of
+    /// surfacing later as an unexplained remote-control failure.
     fn window_match() -> Option<String> {
         std::env::var("KITTY_WINDOW_ID")
+            .ok()?
+            .trim()
+            .parse::<u64>()
             .ok()
-            .filter(|s| !s.is_empty())
             .map(|id| format!("id:{id}"))
+    }
+
+    fn require_window() -> Result<String> {
+        Self::window_match().ok_or_else(|| {
+            anyhow!(
+                "$KITTY_WINDOW_ID is missing or not a number, so tcap cannot tell kitty\n\
+                 which window to read.\n\n\
+                 Without it kitty returns whichever window is focused, which may be a\n\
+                 different pane — tcap refuses rather than risk showing you another\n\
+                 window's output, which could contain secrets.\n\n\
+                 kitty sets this automatically; if it is missing, the environment was\n\
+                 cleared somewhere between kitty and this shell."
+            )
+        })
+    }
+
+    /// The full `get-text` argv, shared by `fetch` and `diagnose`.
+    ///
+    /// Built once so the two cannot drift: if they disagreed, `doctor` would
+    /// report the capture path healthy while `fetch` failed — the worst outcome
+    /// for a tool whose job is telling you what is wrong.
+    fn get_text_args<'a>(
+        &self,
+        listen_on: &'a Option<String>,
+        window: &'a str,
+        ansi: bool,
+    ) -> Vec<&'a str> {
+        let mut args = self.rc_args(listen_on);
+        args.push("get-text");
+        // `--match` is a get-text option, not a global one: placed before the
+        // subcommand kitty rejects it with "Unknown option: --match".
+        args.extend_from_slice(&["--match", window]);
+        // `last_non_empty_output`, not `last_cmd_output`: kitty counts the
+        // running tcap as the current command, so the latter returns tcap's own
+        // (empty) output. That extent is for a keybinding pressed at the prompt.
+        args.extend_from_slice(&["--extent", "last_non_empty_output"]);
+        if ansi {
+            args.push("--ansi");
+        }
+        args
     }
 }
 
@@ -154,25 +203,8 @@ impl Backend for Kitty {
         }
 
         let listen_on = Self::listen_on();
-        let window = Self::window_match();
-        let mut args = self.rc_args(&listen_on);
-        args.push("get-text");
-        // `--match` is a get-text option, not a global one: before the
-        // subcommand kitty rejects it with "Unknown option: --match".
-        if let Some(w) = &window {
-            args.extend_from_slice(&["--match", w]);
-        }
-        // `last_non_empty_output`, not `last_cmd_output`.
-        //
-        // kitty counts the command currently executing — tcap itself — as the
-        // last command, so `last_cmd_output` returns tcap's own output, which is
-        // empty. That extent is meant for a keybinding pressed at the prompt,
-        // where nothing is running. Skipping empty output steps back over
-        // tcap's own invocation to the command the user actually cares about.
-        args.extend_from_slice(&["--extent", "last_non_empty_output"]);
-        if raw {
-            args.push("--ansi");
-        }
+        let window = Self::require_window()?;
+        let args = self.get_text_args(&listen_on, &window, raw);
 
         run(&self.exe, &args)
             .map(Fetched::from)
@@ -183,55 +215,156 @@ impl Backend for Kitty {
         let mut d = vec![Diagnostic::ok("kitty binary", self.exe.clone())];
 
         let listen_on = Self::listen_on();
-        let mut args = self.rc_args(&listen_on);
-        args.push("ls");
-
         let channel = match &listen_on {
             Some(sock) => format!("socket {sock}"),
             None => "escape-code channel (no $KITTY_LISTEN_ON)".to_string(),
         };
+
+        let mut args = self.rc_args(&listen_on);
+        args.push("ls");
         d.push(match run(&self.exe, &args) {
             Ok(_) => Diagnostic::ok("remote control", format!("reachable via {channel}")),
+            // The underlying error is kept: the hint is a guess from keywords,
+            // and for anything it does not recognise the real message is the
+            // only useful thing doctor can say.
             Err(e) => Diagnostic::bad(
                 "remote control",
-                format!("{}\n{}", channel, Self::remote_control_hint(&e, &listen_on)),
+                format!(
+                    "{e}\n         via {channel}\n         {}",
+                    Self::remote_control_hint(&e, &listen_on)
+                ),
             ),
         });
 
-        // The real test of shell integration is whether the extent resolves.
-        let window = Self::window_match();
-        let mut probe = self.rc_args(&listen_on);
-        probe.push("get-text");
-        if let Some(w) = &window {
-            probe.extend_from_slice(&["--match", w]);
-        }
-        probe.extend_from_slice(&["--extent", "last_non_empty_output"]);
-        d.push(match run(&self.exe, &probe) {
-            Ok(t) if t.trim().is_empty() => Diagnostic::bad(
-                "shell integration",
-                "the extent resolved but returned nothing — kitty's own shell \
-                 integration is probably off (`shell_integration enabled` in kitty.conf)",
-            ),
-            Ok(_) => Diagnostic::ok("shell integration", "last_non_empty_output resolves"),
-            Err(e) => Diagnostic::bad(
-                "shell integration",
-                format!("{e} — kitty needs shell_integration enabled for this extent"),
-            ),
-        });
+        match Self::window_match() {
+            Some(w) => {
+                d.push(Diagnostic::ok("window", w.clone()));
 
-        d.push(match Self::window_match() {
-            Some(w) => Diagnostic::ok("window", w),
-            None => Diagnostic::bad(
+                // Probe exactly what fetch runs, so doctor cannot report a path
+                // healthy that fetch would fail on.
+                let probe = self.get_text_args(&listen_on, &w, false);
+                d.push(match run(&self.exe, &probe) {
+                    Ok(t) if t.trim().is_empty() => Diagnostic::bad(
+                        "shell integration",
+                        "the extent resolved but returned nothing — kitty's own shell \
+                         integration is probably off (`shell_integration enabled`)",
+                    ),
+                    Ok(_) => Diagnostic::ok("shell integration", "last_non_empty_output resolves"),
+                    Err(e) => Diagnostic::bad("shell integration", e.to_string()),
+                });
+            }
+            None => d.push(Diagnostic::bad(
                 "window",
-                "$KITTY_WINDOW_ID unset — kitty will read the focused window",
-            ),
-        });
+                "$KITTY_WINDOW_ID missing or not a number — tcap will refuse to capture \
+                 rather than read whichever window is focused",
+            )),
+        }
 
         d.push(Diagnostic::bad(
             "history depth",
-            "kitty serves only the latest command; -c 2 and beyond need tmux",
+            "kitty serves only the latest output; -c 2 and beyond need tmux",
         ));
 
         d
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kitty() -> Kitty {
+        Kitty {
+            exe: "kitten".into(),
+        }
+    }
+
+    /// Locks in the two argv facts that were wrong in the field: the extent, and
+    /// `--match` following the subcommand rather than preceding it.
+    #[test]
+    fn get_text_argv_order_and_extent() {
+        let k = kitty();
+        let args = k.get_text_args(&None, "id:7", false);
+        assert_eq!(
+            args,
+            vec![
+                "@",
+                "get-text",
+                "--match",
+                "id:7",
+                "--extent",
+                "last_non_empty_output"
+            ]
+        );
+
+        let sub = args.iter().position(|a| *a == "get-text").unwrap();
+        let m = args.iter().position(|a| *a == "--match").unwrap();
+        assert!(m > sub, "--match is a get-text option, not a global one");
+        assert!(
+            !args.contains(&"last_cmd_output"),
+            "last_cmd_output returns tcap's own empty output"
+        );
+    }
+
+    #[test]
+    fn socket_is_targeted_before_the_subcommand() {
+        let k = kitty();
+        let sock = Some("unix:/tmp/kitty-1".to_string());
+        let args = k.get_text_args(&sock, "id:7", false);
+        assert_eq!(&args[..3], &["@", "--to", "unix:/tmp/kitty-1"]);
+        assert_eq!(
+            args[3], "get-text",
+            "--to is global, so it precedes get-text"
+        );
+    }
+
+    #[test]
+    fn ansi_only_when_raw() {
+        let k = kitty();
+        assert!(!k.get_text_args(&None, "id:1", false).contains(&"--ansi"));
+        assert!(k.get_text_args(&None, "id:1", true).contains(&"--ansi"));
+    }
+
+    /// A non-numeric id must be rejected rather than widening the match.
+    #[test]
+    fn window_match_requires_a_number() {
+        let cases = [
+            ("7", Some("id:7")),
+            (" 7 ", Some("id:7")),
+            ("", None),
+            ("all", None),
+            ("1 or 2", None),
+        ];
+        for (raw, want) in cases {
+            let got = raw.trim().parse::<u64>().ok().map(|id| format!("id:{id}"));
+            assert_eq!(got.as_deref(), want, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn hint_matches_the_mode_in_force() {
+        let socket_err = anyhow!("Error: Remote control is allowed over a socket only");
+
+        // socket-only with no socket: the fix is listen_on, never `yes`.
+        let no_sock = Kitty::remote_control_hint(&socket_err, &None);
+        assert!(no_sock.contains("listen_on"), "{no_sock}");
+        assert!(
+            !no_sock.contains("allow_remote_control yes"),
+            "must not tell a socket-only user to loosen the setting: {no_sock}"
+        );
+
+        // socket-only with a socket that was refused: restart, not reconfigure.
+        let with_sock = Kitty::remote_control_hint(&socket_err, &Some("unix:/tmp/k".into()));
+        assert!(with_sock.contains("unix:/tmp/k"), "{with_sock}");
+
+        let pw = Kitty::remote_control_hint(&anyhow!("Error: password required"), &None);
+        assert!(pw.contains("remote_control_password"), "{pw}");
+
+        // Anything unrecognised must hedge rather than assert a cause.
+        let other = Kitty::remote_control_hint(&anyhow!("Error: Unknown option: --match"), &None);
+        assert!(
+            other.contains("If this is a remote-control problem"),
+            "{other}"
+        );
     }
 }

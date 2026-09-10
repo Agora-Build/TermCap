@@ -103,10 +103,15 @@ unrelated jobs.
 
 Two things worth knowing up front:
 
-**Only tmux can reach past the most recent command.** kitty exposes a
-`last_cmd_output` extent and nothing older; iTerm2 exposes only its latest
-prompt. So `tcap -c 2` fails there with a pointer to tmux rather than quietly
-returning the wrong block.
+**Only tmux can reach past the most recent command.** kitty exposes only the
+latest output and nothing older; iTerm2 exposes only its latest prompt. So `tcap
+-c 2` fails there with a pointer to tmux rather than quietly returning the wrong
+block.
+
+**On kitty, output is the last *non-empty* output**, because kitty counts the
+running `tcap` as the current command. So a command that printed nothing, or two
+`tcap` runs in a row, yields an older output under the current header. tcap warns
+on stderr when it can tell; tmux has no such ambiguity.
 
 **tmux wins whenever it's running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's rendered viewport rather than the shell's real
