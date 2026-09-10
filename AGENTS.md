@@ -30,6 +30,13 @@ tmux end-to-end tests exist to catch.
 
 **`$?` must be read on the first line of precmd**, before anything can clobber it.
 
+**The bash integration has two branches.** When bash-preexec is loaded (it ships with iTerm2
+shell integration, Atuin and starship) it already owns the DEBUG trap, so tcap registers into
+its `preexec_functions`/`precmd_functions` arrays; installing a competing trap captures
+bash-preexec's own internals (`__bp_interactive_mode`) instead of the user's command. Without
+it, tcap installs its own trap. Both branches are covered by
+`every_available_shell_integration_records`, which runs bash with and without rc files.
+
 **Command text reaches the binary as a single argv element**, so quoting, backslashes and
 newlines need no escaping.
 
