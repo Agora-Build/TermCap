@@ -112,9 +112,17 @@ impl Kitty {
         }
 
         if msg.contains("password") {
-            return "kitty is requiring a remote-control password, which tcap does not \
-                 send. Allow this one command without a password in kitty.conf:\n  \
-                 remote_control_password \"\" get-text"
+            // Deliberately not `remote_control_password "" get-text`: that would
+            // remove authentication from the one call that dumps terminal
+            // contents, for every process that can reach the socket, to work
+            // around tcap's own limitation. Better to be unsupported.
+            return "kitty is requiring a remote-control password, which tcap cannot send, \
+                 so this setup is unsupported.\n\
+                 Rather than weaken authentication for `get-text` — which returns whatever \
+                 is on screen, credentials included — either run inside tmux, which needs \
+                 no kitty remote control at all, or expose kitty on a Unix socket only your \
+                 user can reach:\n  allow_remote_control socket-only\n  \
+                 listen_on unix:/tmp/kitty-{kitty_pid}"
                 .to_string();
         }
 
@@ -134,16 +142,21 @@ impl Kitty {
     /// fatal rather than omitting the flag: the fallback would put another
     /// pane's scrollback, secrets included, under this command's header.
     ///
+    /// The guarantee is bounded: `id:N` is instance-local, so it identifies this
+    /// window within whichever instance `--to` reaches. A stale or shared
+    /// $KITTY_LISTEN_ON could still point at a different instance.
+    ///
     /// The id is parsed as a number so a poisoned variable cannot widen the
     /// match expression, and so a malformed one is reported as such instead of
     /// surfacing later as an unexplained remote-control failure.
     fn window_match() -> Option<String> {
-        std::env::var("KITTY_WINDOW_ID")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .map(|id| format!("id:{id}"))
+        Self::parse_window_id(&std::env::var("KITTY_WINDOW_ID").ok()?)
+    }
+
+    /// Split out so the numeric guarantee is testable without touching the
+    /// environment, which is racy across threads.
+    fn parse_window_id(raw: &str) -> Option<String> {
+        raw.trim().parse::<u64>().ok().map(|id| format!("id:{id}"))
     }
 
     fn require_window() -> Result<String> {
@@ -192,6 +205,12 @@ impl Backend for Kitty {
         "kitty"
     }
 
+    /// kitty returns the last non-empty output, which need not belong to the
+    /// command tcap's shell record names.
+    fn has_command_boundaries(&self) -> bool {
+        false
+    }
+
     fn fetch(&self, index: usize, _rec: Option<&Record>, raw: bool) -> Result<Fetched> {
         if index > 1 {
             return Err(anyhow!(
@@ -222,6 +241,7 @@ impl Backend for Kitty {
 
         let mut args = self.rc_args(&listen_on);
         args.push("ls");
+        let reachable = run(&self.exe, &args).is_ok();
         d.push(match run(&self.exe, &args) {
             Ok(_) => Diagnostic::ok("remote control", format!("reachable via {channel}")),
             // The underlying error is kept: the hint is a guess from keywords,
@@ -241,7 +261,12 @@ impl Backend for Kitty {
                 d.push(Diagnostic::ok("window", w.clone()));
 
                 // Probe exactly what fetch runs, so doctor cannot report a path
-                // healthy that fetch would fail on.
+                // healthy that fetch would fail on. Skipped when remote control
+                // is already down, otherwise the same failure gets reported a
+                // second time under an unrelated label.
+                if !reachable {
+                    return d;
+                }
                 let probe = self.get_text_args(&listen_on, &w, false);
                 d.push(match run(&self.exe, &probe) {
                     Ok(t) if t.trim().is_empty() => Diagnostic::bad(
@@ -358,7 +383,7 @@ mod tests {
         assert!(with_sock.contains("unix:/tmp/k"), "{with_sock}");
 
         let pw = Kitty::remote_control_hint(&anyhow!("Error: password required"), &None);
-        assert!(pw.contains("remote_control_password"), "{pw}");
+        assert!(pw.contains("unsupported"), "{pw}");
 
         // Anything unrecognised must hedge rather than assert a cause.
         let other = Kitty::remote_control_hint(&anyhow!("Error: Unknown option: --match"), &None);

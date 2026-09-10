@@ -18,6 +18,10 @@ pub struct Capture {
     pub duration_ms: Option<u64>,
     pub output: String,
     pub source: String,
+    /// True when the backend cannot tie this output to the named command, so
+    /// the metadata above may describe a different command than the body.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
 }
 
 impl Capture {
@@ -29,6 +33,7 @@ impl Capture {
             duration_ms: None,
             output,
             source: source.to_string(),
+            approximate: false,
         }
     }
 

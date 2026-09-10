@@ -126,6 +126,16 @@ fn header(cap: &Capture) -> String {
         s.push_str(&format!("# {}\n", meta.join("  ")));
     }
 
+    // Without real boundaries the metadata above is the shell's record of the
+    // last command, while the body is whatever the terminal last had on screen.
+    // Usually the same thing; when the last command printed nothing, not.
+    if cap.approximate {
+        s.push_str(&format!(
+            "# note: {} returns the last non-empty output — it may be an earlier command's\n",
+            cap.source
+        ));
+    }
+
     s
 }
 
@@ -198,6 +208,7 @@ mod tests {
             duration_ms: Some(3200),
             output: "Error: Cannot find module 'foo'".into(),
             source: "tmux".into(),
+            approximate: false,
         }
     }
 
@@ -280,6 +291,32 @@ mod tests {
     fn annotated_falls_back_to_bare_output_without_metadata() {
         let out = render(&[cap_with_output("just text")], Mode::Annotated);
         assert_eq!(out, "just text");
+    }
+
+    /// Metadata over a body the backend cannot vouch for must say so, or the
+    /// header reads as authoritative for text it may not describe.
+    #[test]
+    fn approximate_captures_are_labelled() {
+        let mut c = full_capture();
+        c.source = "kitty".into();
+        c.approximate = true;
+        let out = render(&[c], Mode::Annotated);
+        assert!(
+            out.contains("# note: kitty returns the last non-empty output"),
+            "{out}"
+        );
+
+        // Exact backends must stay unqualified.
+        let exact = render(&[full_capture()], Mode::Annotated);
+        assert!(!exact.contains("# note:"), "{exact}");
+    }
+
+    #[test]
+    fn approximate_is_only_serialised_when_true() {
+        let mut c = full_capture();
+        c.approximate = true;
+        assert!(render(&[c], Mode::Json).contains("\"approximate\": true"));
+        assert!(!render(&[full_capture()], Mode::Json).contains("approximate"));
     }
 
     #[test]

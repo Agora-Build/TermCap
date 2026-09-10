@@ -84,6 +84,8 @@ tcap --output         # output only, no header
 tcap --command        # the command text only
 tcap --raw            # verbatim, ANSI colour intact
 tcap --json           # {command, exit_code, cwd, duration_ms, output, source}
+                      # plus "approximate": true when the backend cannot vouch
+                      # that the output belongs to that command
 tcap --copy           # also copy to the clipboard
 tcap --max-bytes 8000 # elide the middle to fit a smaller context window
 ```
@@ -96,7 +98,7 @@ unrelated jobs.
 | Terminal | Last command | Older (`-c 2`) | Needs |
 |---|---|---|---|
 | **tmux** | yes | **yes** | nothing |
-| **kitty** | yes | no | `allow_remote_control yes` |
+| **kitty** | yes | no | remote control: `yes`, or `socket-only` + `listen_on` |
 | **iTerm2** | yes | no | Shell Integration + `pip install iterm2` |
 | **WezTerm** | not yet | no | run inside tmux |
 | Ghostty, Terminal.app, Alacritty | no | no | run inside tmux |
@@ -110,8 +112,8 @@ block.
 
 **On kitty, output is the last *non-empty* output**, because kitty counts the
 running `tcap` as the current command. So a command that printed nothing, or two
-`tcap` runs in a row, yields an older output under the current header. tcap warns
-on stderr when it can tell; tmux has no such ambiguity.
+`tcap` runs in a row, yields an older output under the current header. The header carries a `# note:` line saying so, and `--json` sets
+`"approximate": true`; tmux has no such ambiguity.
 
 **tmux wins whenever it's running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's rendered viewport rather than the shell's real

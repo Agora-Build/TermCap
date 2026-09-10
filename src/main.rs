@@ -108,7 +108,12 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         let rec = state::nth_from_end(&records, index);
 
         match backend.fetch(index, rec, raw) {
-            Ok(fetched) => caps.push(build_capture(fetched, rec, backend.name())),
+            Ok(fetched) => caps.push(build_capture(
+                fetched,
+                rec,
+                backend.name(),
+                !backend.has_command_boundaries(),
+            )),
             // The block the user explicitly asked for must report its error.
             // Extra blocks requested via -C are best-effort: running out of
             // history is normal and should not fail the whole capture.
@@ -152,12 +157,13 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode,
     // Backends without real command boundaries return the last *non-empty*
     // output. tcap's own output is non-empty, so a capture straight after
     // another one hands back the previous capture rather than a command.
-    if after_tcap && !backend.supports_history() {
+    if after_tcap && !backend.has_command_boundaries() {
         eprintln!(
             "tcap: the previous command was tcap itself, and {} can only report the\n\
-             \x20 last non-empty output — so this is probably tcap's own output rather\n\
-             \x20 than a command's. Re-run the command you meant to capture, or use\n\
-             \x20 tmux, which records exact boundaries.",
+             \x20 last non-empty output — so this is most likely the previous capture's\n\
+             \x20 own output, or whatever its pipeline printed, rather than a command's.\n\
+             \x20 Re-run the command you meant to capture, or use tmux, which records\n\
+             \x20 exact boundaries.",
             backend.name()
         );
     }
@@ -209,8 +215,14 @@ fn detect_shell() -> String {
 /// The shell record wins where both have a value — it saw the command as typed
 /// and is the only source of duration. Backend metadata fills the gaps, which is
 /// what makes iTerm2 usable with no shell integration at all.
-fn build_capture(fetched: backend::Fetched, rec: Option<&Record>, source: &str) -> Capture {
+fn build_capture(
+    fetched: backend::Fetched,
+    rec: Option<&Record>,
+    source: &str,
+    approximate: bool,
+) -> Capture {
     let mut cap = Capture::new(fetched.output, source);
+    cap.approximate = approximate;
 
     cap.command = fetched.command;
     cap.exit_code = fetched.exit_code;

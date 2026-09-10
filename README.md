@@ -83,6 +83,8 @@ tcap --output         # output only, no header
 tcap --command        # the command text only
 tcap --raw            # verbatim, ANSI colour intact, no header
 tcap --json           # {command, exit_code, cwd, duration_ms, output, source}
+                      # plus "approximate": true when the backend cannot vouch
+                      # that the output belongs to that command
 tcap --copy           # also copy to the clipboard
 ```
 
@@ -162,7 +164,8 @@ wrong block.
 wasn't empty. The consequence: if your last command printed nothing, kitty
 returns an *older* command's output while the header names the last one — and two
 `tcap` runs in a row return the first run's own output, since that was the last
-thing to print. tcap warns on stderr when it can tell. tmux has no such
+thing to print. The annotated header carries a `# note:` line saying so, and `--json` sets
+`"approximate": true`. tmux has no such
 ambiguity, because the shell hook records real boundaries. kitty also
 needs remote control reachable — either `allow_remote_control yes`, or
 `socket-only` together with `listen_on unix:/tmp/kitty-{kitty_pid}`.
@@ -187,9 +190,10 @@ and the next begins. `tcap` fills those gaps from two sides:
 
 - **Shell hooks** (`tcap init`) record the command text, exit code, cwd and
   duration on every prompt.
-- **Terminal adapters** retrieve the actual text. kitty and iTerm2 know their own
-  command boundaries; tmux does not (it has no OSC 133 support), so the hook also
-  records where output starts and ends.
+- **Terminal adapters** retrieve the actual text. tmux has no OSC 133 support, so
+  the hook also records where output starts and ends — which is why it is the
+  only backend with exact boundaries. iTerm2 tracks its own prompts; kitty can
+  only return its last non-empty output.
 
 Those tmux coordinates are stored as `history_size + cursor_y`, which is stable
 under scrolling: as lines scroll off, `history_size` grows by exactly as much as
@@ -199,7 +203,7 @@ under scrolling: as lines scroll off, `history_size` grows by exactly as much as
 ## Development
 
 ```sh
-cargo test                       # 54 unit + 11 end-to-end tests
+cargo test                       # 56 unit + 11 end-to-end tests
 git config core.hooksPath .githooks   # run fmt, clippy and tests before every push
 ```
 
