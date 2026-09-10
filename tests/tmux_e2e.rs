@@ -118,7 +118,7 @@ impl Shell {
         match self {
             Shell::Zsh => "zsh",
             Shell::Bash => "bash",
-            Shell::BashBare => "bash --norc",
+            Shell::BashBare => "bash (no rc)",
         }
     }
 
