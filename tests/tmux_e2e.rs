@@ -146,7 +146,6 @@ impl Session {
         // The shell is explicit rather than inherited from $SHELL, which is zsh
         // on a dev machine and bash on CI. The integrations are not
         // interchangeable, so inheriting silently installed nothing.
-        let tmpdir = format!("TMPDIR={}", dir.display());
         let mut args: Vec<String> = vec![
             "new-session".into(),
             "-d".into(),
@@ -157,8 +156,21 @@ impl Session {
             "-y".into(),
             "50".into(),
             "-e".into(),
-            tmpdir,
+            format!("TMPDIR={}", dir.display()),
         ];
+
+        if shell == Shell::Zsh {
+            // A zsh with no rc file runs zsh-newuser-install, an interactive
+            // wizard that swallows whatever we type at it — on a fresh Ubuntu
+            // runner it ate the "ex" of our "export" line, leaving `port
+            // PATH=...`, so tcap never reached PATH and nothing recorded.
+            // Pointing ZDOTDIR at a directory that already has a .zshrc
+            // suppresses it, and keeps the user's own rc out of the test.
+            std::fs::write(dir.join(".zshrc"), "").unwrap();
+            args.push("-e".into());
+            args.push(format!("ZDOTDIR={}", dir.display()));
+        }
+
         args.extend(shell.command().expect("shell binary vanished"));
         tmux(&args.iter().map(String::as_str).collect::<Vec<_>>());
 
@@ -182,6 +194,8 @@ impl Session {
             log = log.display(),
         ));
 
+        s.verify_setup(&log, shell);
+
         // The hook is installed *during* that line, so its own preexec never
         // ran and it records nothing. The next command is the first to appear
         // in the log — wait for it, so a slow shell startup cannot masquerade
@@ -189,6 +203,40 @@ impl Session {
         s.send("true");
         s.wait_for_records(1);
         s
+    }
+
+    /// Fail immediately, and specifically, if setup did not take.
+    ///
+    /// Without this a mangled setup line surfaces 45 seconds later as a generic
+    /// "saw 0 recorded commands", which is what made the CI failure so hard to
+    /// place.
+    fn verify_setup(&self, log: &std::path::Path, shell: Shell) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            contents = std::fs::read_to_string(log).unwrap_or_default();
+            if contents.contains("init_rc=") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        let ctx = shell.label();
+        assert!(
+            contents.contains("init_rc="),
+            "{ctx}: shell never completed setup\n--- setup.log ---\n{contents}\n--- pane ---\n{}",
+            tmux(&["capture-pane", "-p", "-t", &self.target()])
+        );
+        assert!(
+            contents.lines().any(|l| l.starts_with("tcap=/")),
+            "{ctx}: tcap did not reach PATH — the setup line was probably \
+             mangled by a shell startup prompt\n--- setup.log ---\n{contents}\n--- pane ---\n{}",
+            tmux(&["capture-pane", "-p", "-t", &self.target()])
+        );
+        assert!(
+            contents.contains("init_rc=0"),
+            "{ctx}: `tcap init` failed\n--- setup.log ---\n{contents}"
+        );
     }
 
     fn target(&self) -> String {
