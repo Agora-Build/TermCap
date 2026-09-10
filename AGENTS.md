@@ -61,12 +61,16 @@ cargo test                            # unit + end-to-end
 git config core.hooksPath .githooks   # fmt, clippy, tests before every push
 ```
 
-The e2e harness sets `ZDOTDIR` to a directory containing an empty `.zshrc`. A zsh with no rc
-file runs `zsh-newuser-install`, an interactive wizard that swallows sent keystrokes — on a
-fresh Ubuntu runner it ate the `ex` of `export`, leaving `port PATH=...`, so tcap never
-reached PATH and every test failed as "saw 0 recorded commands". Setup now logs `command -v
-tcap` and asserts on it, so that class of failure names itself instead of surfacing as a
-timeout.
+The e2e harness installs tcap through an **rc file**, never by typing at the prompt. Anything
+a shell asks at startup eats sent keystrokes: Ubuntu's zsh has no `~/.zshrc`, so it ran
+`zsh-newuser-install` (which ate the `ex` of `export`, leaving `port PATH=...`), and once that
+was suppressed compinit's "insecure directories" prompt ate the `e` (`xport PATH=...`). Both
+surfaced only as "saw 0 recorded commands". zsh gets its rc via `ZDOTDIR` plus
+`skip_global_compinit=1`; bash via `--rcfile`, with the non-bare variant sourcing `~/.bashrc`
+first so bash-preexec is exercised where present.
+
+Setup is verified up front — tcap must resolve on PATH and `tcap init` must exit 0 — so a
+broken environment names itself instead of surfacing 45s later as a timeout.
 
 End-to-end tests (`tests/tmux_e2e.rs`) drive a real tmux session. They synchronise by polling
 tcap's own state log — never by appending a marker command to the line under test, which
