@@ -51,6 +51,32 @@ fn tmux_quiet(args: &[&str]) {
     let _ = Command::new("tmux").args(args).output();
 }
 
+/// Like [`tmux`], but retries first.
+///
+/// Creating a session can lose a race against a server that is still shutting
+/// down — `tmux kill-server` in a neighbouring shell is enough to do it — and
+/// that is a transient worth surviving rather than a failure worth reporting.
+fn tmux_retrying(args: &[&str]) -> String {
+    for attempt in 0..4 {
+        let out = Command::new("tmux")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("running tmux {args:?}: {e}"));
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+        if attempt == 3 {
+            panic!(
+                "tmux {args:?} failed after 4 attempts ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200 * (attempt + 1)));
+    }
+    unreachable!()
+}
+
 fn which(program: &str) -> Option<String> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(program))
@@ -160,11 +186,12 @@ impl Session {
         // Installing tcap the way a user would — a line in an rc file — rather
         // than typing it at the prompt, which races shell startup.
         let setup = format!(
+            // The eval comes last: in bash any line after it fires the
+            // freshly-installed DEBUG trap and is recorded as if the user had
+            // typed it.
             "export PATH=\"{bin}:$PATH\"\n\
-             eval \"$(tcap init {sh})\" > {log} 2>&1\n\
-             echo \"init_rc=$?\" >> {log}\n\
-             echo \"tcap=$(command -v tcap)\" >> {log}\n\
-             echo \"TMPDIR=$TMPDIR\" >> {log}\n",
+             {{ echo \"tcap=$(command -v tcap)\"; echo \"TMPDIR=$TMPDIR\"; }} > {log} 2>&1\n\
+             eval \"$(tcap init {sh})\" >> {log} 2>&1\n",
             bin = bin_dir.display(),
             sh = shell.name(),
             log = log.display(),
@@ -207,7 +234,7 @@ impl Session {
             args.push(var);
         }
         args.extend(shell.command(&rc).expect("shell binary vanished"));
-        tmux(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        tmux_retrying(&args.iter().map(String::as_str).collect::<Vec<_>>());
 
         let s = Self {
             name: name.to_string(),
@@ -219,8 +246,7 @@ impl Session {
         // The hook was installed by the rc file, before the first prompt, so
         // the next command is the first that can appear in the log. Waiting for
         // it stops a slow shell startup masquerading as a capture bug.
-        s.send("true");
-        s.wait_for_records(1);
+        s.send_and_wait("true", "true");
         s
     }
 
@@ -234,7 +260,7 @@ impl Session {
         let mut contents = String::new();
         while Instant::now() < deadline {
             contents = std::fs::read_to_string(log).unwrap_or_default();
-            if contents.contains("init_rc=") {
+            if contents.contains("tcap=") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(40));
@@ -242,7 +268,7 @@ impl Session {
 
         let ctx = shell.label();
         assert!(
-            contents.contains("init_rc="),
+            contents.contains("tcap="),
             "{ctx}: shell never completed setup\n--- setup.log ---\n{contents}\n--- pane ---\n{}",
             tmux(&["capture-pane", "-p", "-t", &self.target()])
         );
@@ -253,8 +279,8 @@ impl Session {
             tmux(&["capture-pane", "-p", "-t", &self.target()])
         );
         assert!(
-            contents.contains("init_rc=0"),
-            "{ctx}: `tcap init` failed\n--- setup.log ---\n{contents}"
+            !contents.contains("not found"),
+            "{ctx}: `tcap init` reported an error\n--- setup.log ---\n{contents}"
         );
     }
 
@@ -285,8 +311,18 @@ impl Session {
     /// measured — it becomes part of the recorded command text and its exit
     /// status replaces the real one — so instead we watch tcap's own log grow.
     fn record_count(&self) -> usize {
+        self.recorded_commands().len()
+    }
+
+    /// Every command the hook has recorded, oldest first.
+    ///
+    /// Waiting on a *count* is not safe: in bash the rc file's own trailing
+    /// lines fire the DEBUG trap and get recorded, so the count runs one ahead
+    /// and every wait returns before its command has actually finished. Waiting
+    /// for the exact command text is immune to that.
+    fn recorded_commands(&self) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return 0;
+            return Vec::new();
         };
         entries
             .flatten()
@@ -301,8 +337,51 @@ impl Session {
             .map(|e| e.path())
             .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
             .filter_map(|p| std::fs::read_to_string(p).ok())
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .sum()
+            .flat_map(|s| {
+                s.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter_map(|v| v.get("command")?.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn count_matching(&self, token: &str) -> usize {
+        self.recorded_commands()
+            .iter()
+            .filter(|c| c.contains(token))
+            .count()
+    }
+
+    /// Send `line` and block until the hook records it.
+    ///
+    /// Matching is by substring rather than equality, because shells differ in
+    /// how faithfully they can report a command line. It counts occurrences
+    /// rather than testing presence: the same text can legitimately be run more
+    /// than once — setup runs `true`, and so does one of the tests — and
+    /// presence alone would match the earlier one and return before this
+    /// command had even started.
+    fn send_and_wait(&self, line: &str, token: &str) {
+        let before = self.count_matching(token);
+        self.send(line);
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if self.count_matching(token) > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        panic!(
+            "timed out waiting for a new recorded command containing `{token}`\n\
+             recorded so far: {:#?}\n\
+             --- setup.log ---\n{}\n--- pane ---\n{}",
+            self.recorded_commands(),
+            std::fs::read_to_string(self.dir.join("setup.log"))
+                .unwrap_or_else(|e| format!("(unreadable: {e})")),
+            tmux(&["capture-pane", "-p", "-t", &self.target()])
+        );
     }
 
     /// Recursive listing of the session's temp dir, for failure messages.
@@ -357,9 +436,7 @@ impl Session {
 
     /// Run a shell command verbatim and wait for the hook to record it.
     fn run(&self, cmd: &str) {
-        let before = self.record_count();
-        self.send(cmd);
-        self.wait_for_records(before + 1);
+        self.send_and_wait(cmd, cmd);
     }
 
     /// Run tcap with `args` and return its stdout.
@@ -367,10 +444,34 @@ impl Session {
     /// The redirect is part of the command line, which is harmless: the whole
     /// line still begins with `tcap`, so indexing skips it as an invocation.
     fn tcap(&self, args: &str) -> String {
-        let out = self.dir.join(format!("out{}.txt", rand_suffix()));
-        let before = self.record_count();
-        self.send(&format!("tcap {args} > {} 2>/dev/null", out.display()));
-        self.wait_for_records(before + 1);
+        let stem = rand_suffix();
+        let out = self.dir.join(format!("out{stem}.txt"));
+        let err = self.dir.join(format!("err{stem}.txt"));
+        let rc = self.dir.join(format!("rc{stem}.txt"));
+
+        // Keep stderr and the exit code rather than discarding them: routing
+        // stderr to /dev/null turned a failing tcap into an empty string and an
+        // assertion that could not say why.
+        let sent = format!(
+            "tcap {args} > {} 2> {}; echo $? > {}",
+            out.display(),
+            err.display(),
+            rc.display()
+        );
+        // The stem appears in all three redirect paths, so it identifies this
+        // invocation however much of the line the shell managed to record.
+        self.send_and_wait(&sent, &stem);
+
+        let status = std::fs::read_to_string(&rc).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&err).unwrap_or_default();
+        assert_eq!(
+            status.trim(),
+            "0",
+            "`tcap {args}` exited {}\n--- stderr ---\n{stderr}\n--- pane ---\n{}",
+            status.trim(),
+            tmux(&["capture-pane", "-p", "-t", &self.target()])
+        );
+
         std::fs::read_to_string(&out).unwrap_or_default()
     }
 }
@@ -462,6 +563,29 @@ fn every_available_shell_integration_records() {
         assert!(
             prev.contains("shell_probe"),
             "{ctx}: -c 2 did not reach the earlier command:\n{prev}"
+        );
+
+        // The whole line, not just its first simple command. bash's DEBUG trap
+        // sees only `echo one` of `echo one; echo two`, so this needs the
+        // history lookup rather than $BASH_COMMAND.
+        s.run("echo one; echo two");
+        let cmd = s.tcap("--command");
+        assert_eq!(
+            cmd.trim(),
+            "echo one; echo two",
+            "{ctx}: compound command was truncated"
+        );
+
+        // tcap's own integration script must not appear as a user command; the
+        // bash DEBUG trap used to be armed before its own setup lines ran.
+        let recorded = s.recorded_commands();
+        let noise: Vec<&String> = recorded
+            .iter()
+            .filter(|c| c.contains("PROMPT_COMMAND") || c.contains("_tcap_"))
+            .collect();
+        assert!(
+            noise.is_empty(),
+            "{ctx}: tcap's own setup was recorded as user commands: {noise:#?}"
         );
     }
 }

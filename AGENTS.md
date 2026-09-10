@@ -30,6 +30,11 @@ tmux end-to-end tests exist to catch.
 
 **`$?` must be read on the first line of precmd**, before anything can clobber it.
 
+**bash's DEBUG trap sees only the current simple command**, so `make; echo done` would record
+just `make`. The integration reads `history 1` instead to get the line as typed. The trap is
+also armed as the very last statement in `shell/tcap.bash`: armed any earlier, it catches the
+script's own remaining lines and records them as if the user had typed them.
+
 **The bash integration has two branches.** When bash-preexec is loaded (it ships with iTerm2
 shell integration, Atuin and starship) it already owns the DEBUG trap, so tcap registers into
 its `preexec_functions`/`precmd_functions` arrays; installing a competing trap captures
