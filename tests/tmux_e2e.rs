@@ -100,12 +100,21 @@ impl Shell {
         which(self.name())
     }
 
-    /// The command tmux should run for the pane.
-    fn command(self) -> Option<Vec<String>> {
+    /// The command tmux runs for the pane, wired to read `rc` at startup.
+    ///
+    /// The rc file is how setup reaches the shell. Typing it at the prompt is
+    /// unreliable: a shell that puts up a startup prompt — zsh's newuser wizard,
+    /// or compinit's "insecure directories" question — swallows the first
+    /// characters sent and silently mangles the line.
+    fn command(self, rc: &std::path::Path) -> Option<Vec<String>> {
         let bin = self.binary()?;
+        let rc = rc.to_string_lossy().into_owned();
         Some(match self {
-            Shell::BashBare => vec![bin, "--norc".into(), "--noprofile".into()],
-            _ => vec![bin],
+            // zsh finds its rc through ZDOTDIR, set by the caller.
+            Shell::Zsh => vec![bin],
+            Shell::Bash => vec![bin, "--rcfile".into(), rc],
+            // --norc would override --rcfile, so only --noprofile here.
+            Shell::BashBare => vec![bin, "--noprofile".into(), "--rcfile".into(), rc],
         })
     }
 }
@@ -143,6 +152,43 @@ impl Session {
         std::fs::create_dir_all(&dir).unwrap();
 
         tmux_quiet(&["kill-session", "-t", name]);
+
+        let bin_dir = PathBuf::from(BIN).parent().unwrap().to_path_buf();
+        let log = dir.join("setup.log");
+        let rc = dir.join("rc");
+
+        // Installing tcap the way a user would — a line in an rc file — rather
+        // than typing it at the prompt, which races shell startup.
+        let setup = format!(
+            "export PATH=\"{bin}:$PATH\"\n\
+             eval \"$(tcap init {sh})\" > {log} 2>&1\n\
+             echo \"init_rc=$?\" >> {log}\n\
+             echo \"tcap=$(command -v tcap)\" >> {log}\n\
+             echo \"TMPDIR=$TMPDIR\" >> {log}\n",
+            bin = bin_dir.display(),
+            sh = shell.name(),
+            log = log.display(),
+        );
+
+        let mut env = vec![format!("TMPDIR={}", dir.display())];
+        match shell {
+            Shell::Zsh => {
+                // zsh takes its rc from ZDOTDIR. Having a .zshrc there also
+                // suppresses zsh-newuser-install, and skip_global_compinit
+                // stops Ubuntu's /etc/zsh/zshrc running compinit — both put up
+                // startup prompts that swallow input.
+                std::fs::write(dir.join(".zshrc"), &setup).unwrap();
+                std::fs::write(dir.join(".zshenv"), "skip_global_compinit=1\n").unwrap();
+                env.push(format!("ZDOTDIR={}", dir.display()));
+            }
+            // Keep the developer's own rc so bash-preexec, when installed, is
+            // exercised; --rcfile otherwise replaces it.
+            Shell::Bash => {
+                std::fs::write(&rc, format!("[ -f ~/.bashrc ] && . ~/.bashrc\n{setup}")).unwrap()
+            }
+            Shell::BashBare => std::fs::write(&rc, &setup).unwrap(),
+        }
+
         // The shell is explicit rather than inherited from $SHELL, which is zsh
         // on a dev machine and bash on CI. The integrations are not
         // interchangeable, so inheriting silently installed nothing.
@@ -155,23 +201,12 @@ impl Session {
             "160".into(),
             "-y".into(),
             "50".into(),
-            "-e".into(),
-            format!("TMPDIR={}", dir.display()),
         ];
-
-        if shell == Shell::Zsh {
-            // A zsh with no rc file runs zsh-newuser-install, an interactive
-            // wizard that swallows whatever we type at it — on a fresh Ubuntu
-            // runner it ate the "ex" of our "export" line, leaving `port
-            // PATH=...`, so tcap never reached PATH and nothing recorded.
-            // Pointing ZDOTDIR at a directory that already has a .zshrc
-            // suppresses it, and keeps the user's own rc out of the test.
-            std::fs::write(dir.join(".zshrc"), "").unwrap();
+        for var in env {
             args.push("-e".into());
-            args.push(format!("ZDOTDIR={}", dir.display()));
+            args.push(var);
         }
-
-        args.extend(shell.command().expect("shell binary vanished"));
+        args.extend(shell.command(&rc).expect("shell binary vanished"));
         tmux(&args.iter().map(String::as_str).collect::<Vec<_>>());
 
         let s = Self {
@@ -179,27 +214,11 @@ impl Session {
             dir,
         };
         s.wait_for_shell();
-
-        // Record what setup actually did. Previously this ran `clear`, which
-        // erased the evidence and made every setup failure look identical to a
-        // capture bug.
-        let bin_dir = PathBuf::from(BIN).parent().unwrap().to_path_buf();
-        let log = s.dir.join("setup.log");
-        s.send(&format!(
-            "export PATH=\"{bin}:$PATH\"; \
-             {{ echo \"tcap=$(command -v tcap)\"; echo \"TMPDIR=$TMPDIR\"; \
-             eval \"$(tcap init {sh})\"; echo \"init_rc=$?\"; }} > {log} 2>&1",
-            bin = bin_dir.display(),
-            sh = shell.name(),
-            log = log.display(),
-        ));
-
         s.verify_setup(&log, shell);
 
-        // The hook is installed *during* that line, so its own preexec never
-        // ran and it records nothing. The next command is the first to appear
-        // in the log — wait for it, so a slow shell startup cannot masquerade
-        // as a capture bug.
+        // The hook was installed by the rc file, before the first prompt, so
+        // the next command is the first that can appear in the log. Waiting for
+        // it stops a slow shell startup masquerading as a capture bug.
         s.send("true");
         s.wait_for_records(1);
         s
