@@ -189,7 +189,7 @@ under scrolling: as lines scroll off, `history_size` grows by exactly as much as
 ## Development
 
 ```sh
-cargo test                       # 35 unit + 8 end-to-end tests
+cargo test                       # 49 unit + 11 end-to-end tests
 git config core.hooksPath .githooks   # run fmt, clippy and tests before every push
 ```
 
