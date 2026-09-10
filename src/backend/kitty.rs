@@ -1,14 +1,15 @@
-//! kitty backend.
+//! kitty backend, via `kitty @ get-text` and kitty's own shell-integration
+//! prompt marks. Verified against kitty 0.48.2.
 //!
-//! kitty is the one terminal that ships this feature outright:
-//! `kitty @ get-text --extent=last_cmd_output` returns exactly the last
-//! command's output, using kitty's own shell-integration prompt marks. Verified
-//! against kitty 0.48.2, whose help states the extent "requires
-//! shell_integration to be enabled".
+//! Two things this backend cannot do:
 //!
-//! The limitation is that kitty exposes only the *latest* command block. There
-//! is no extent for "the one before that", so `-c 2` cannot be served here and
-//! fails with a pointer to tmux rather than silently returning the wrong text.
+//! - Reach past the latest output. There is no extent for "the command before
+//!   that", so `-c 2` fails with a pointer to tmux rather than returning the
+//!   wrong text.
+//! - Tie output to a specific command. It asks for the last *non-empty* output
+//!   (see `fetch` for why), so when the last command printed nothing, kitty
+//!   returns an older command's output while the header names the last one.
+//!   tmux has no such ambiguity, having real boundaries.
 
 use anyhow::{anyhow, Result};
 
@@ -84,6 +85,57 @@ impl Kitty {
             .ok()
             .filter(|s| !s.is_empty())
     }
+
+    /// Turn kitty's refusal into the fix for the mode actually in force.
+    ///
+    /// `allow_remote_control` has several values and they need different
+    /// answers: telling a `socket-only` user to set `yes` is wrong advice, and
+    /// its real cause — no socket to talk to — is not obvious from kitty's
+    /// message alone.
+    fn remote_control_hint(err: &anyhow::Error, listen_on: &Option<String>) -> String {
+        let msg = err.to_string().to_lowercase();
+
+        if msg.contains("socket only") || msg.contains("socket-only") {
+            return match listen_on {
+                None => "kitty is set to `allow_remote_control socket-only`, but \
+                     $KITTY_LISTEN_ON is unset, so there is no socket to use.\n\
+                     Add to ~/.config/kitty/kitty.conf and restart kitty:\n  \
+                     listen_on unix:/tmp/kitty-{kitty_pid}\n\
+                     If it is set in your shell but not here, something in between is \
+                     clearing the environment."
+                    .to_string(),
+                Some(sock) => format!(
+                    "the socket at {sock} was refused. Restart kitty so the running \
+                     instance and $KITTY_LISTEN_ON agree."
+                ),
+            };
+        }
+
+        if msg.contains("password") {
+            return "kitty is requiring a remote-control password, which tcap does not \
+                 send. Allow this one command without a password in kitty.conf:\n  \
+                 remote_control_password \"\" get-text"
+                .to_string();
+        }
+
+        "kitty remote control appears to be disabled. In ~/.config/kitty/kitty.conf \
+         either:\n  allow_remote_control yes\nor keep it restricted and give tcap a \
+         socket:\n  allow_remote_control socket-only\n  listen_on unix:/tmp/kitty-{kitty_pid}\n\
+         Then restart kitty."
+            .to_string()
+    }
+
+    /// `--match id:N` for the window tcap is running in.
+    ///
+    /// Without it kitty reads whichever window is *focused*, which is not
+    /// necessarily this one — a capture triggered from a script, or with focus
+    /// on another split, silently returns another window's text.
+    fn window_match() -> Option<String> {
+        std::env::var("KITTY_WINDOW_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|id| format!("id:{id}"))
+    }
 }
 
 impl Backend for Kitty {
@@ -96,26 +148,35 @@ impl Backend for Kitty {
             return Err(anyhow!(
                 "kitty can only report its most recent command's output, so -c {index} \
                  is not available here.\n\n\
-                 kitty exposes a `last_cmd_output` extent but nothing for older\n\
+                 kitty exposes only the latest output and nothing for older\n\
                  commands. To reach further back, run inside tmux."
             ));
         }
 
         let listen_on = Self::listen_on();
+        let window = Self::window_match();
         let mut args = self.rc_args(&listen_on);
-        args.extend_from_slice(&["get-text", "--extent", "last_cmd_output"]);
+        args.push("get-text");
+        // `--match` is a get-text option, not a global one: before the
+        // subcommand kitty rejects it with "Unknown option: --match".
+        if let Some(w) = &window {
+            args.extend_from_slice(&["--match", w]);
+        }
+        // `last_non_empty_output`, not `last_cmd_output`.
+        //
+        // kitty counts the command currently executing — tcap itself — as the
+        // last command, so `last_cmd_output` returns tcap's own output, which is
+        // empty. That extent is meant for a keybinding pressed at the prompt,
+        // where nothing is running. Skipping empty output steps back over
+        // tcap's own invocation to the command the user actually cares about.
+        args.extend_from_slice(&["--extent", "last_non_empty_output"]);
         if raw {
             args.push("--ansi");
         }
 
-        run(&self.exe, &args).map(Fetched::from).map_err(|e| {
-            anyhow!(
-                "{e}\n\n\
-                     kitty remote control may be disabled. Add to ~/.config/kitty/kitty.conf:\n  \
-                     allow_remote_control yes\n\
-                     and make sure shell integration is enabled (it is by default)."
-            )
-        })
+        run(&self.exe, &args)
+            .map(Fetched::from)
+            .map_err(|e| anyhow!("{e}\n\n{}", Self::remote_control_hint(&e, &listen_on)))
     }
 
     fn diagnose(&self) -> Vec<Diagnostic> {
@@ -125,22 +186,44 @@ impl Backend for Kitty {
         let mut args = self.rc_args(&listen_on);
         args.push("ls");
 
+        let channel = match &listen_on {
+            Some(sock) => format!("socket {sock}"),
+            None => "escape-code channel (no $KITTY_LISTEN_ON)".to_string(),
+        };
         d.push(match run(&self.exe, &args) {
-            Ok(_) => Diagnostic::ok("remote control", "enabled and reachable"),
+            Ok(_) => Diagnostic::ok("remote control", format!("reachable via {channel}")),
             Err(e) => Diagnostic::bad(
                 "remote control",
-                format!("{e} — set `allow_remote_control yes` in kitty.conf"),
+                format!("{}\n{}", channel, Self::remote_control_hint(&e, &listen_on)),
             ),
         });
 
         // The real test of shell integration is whether the extent resolves.
+        let window = Self::window_match();
         let mut probe = self.rc_args(&listen_on);
-        probe.extend_from_slice(&["get-text", "--extent", "last_cmd_output"]);
+        probe.push("get-text");
+        if let Some(w) = &window {
+            probe.extend_from_slice(&["--match", w]);
+        }
+        probe.extend_from_slice(&["--extent", "last_non_empty_output"]);
         d.push(match run(&self.exe, &probe) {
-            Ok(_) => Diagnostic::ok("shell integration", "last_cmd_output resolves"),
+            Ok(t) if t.trim().is_empty() => Diagnostic::bad(
+                "shell integration",
+                "the extent resolved but returned nothing — kitty's own shell \
+                 integration is probably off (`shell_integration enabled` in kitty.conf)",
+            ),
+            Ok(_) => Diagnostic::ok("shell integration", "last_non_empty_output resolves"),
             Err(e) => Diagnostic::bad(
                 "shell integration",
                 format!("{e} — kitty needs shell_integration enabled for this extent"),
+            ),
+        });
+
+        d.push(match Self::window_match() {
+            Some(w) => Diagnostic::ok("window", w),
+            None => Diagnostic::bad(
+                "window",
+                "$KITTY_WINDOW_ID unset — kitty will read the focused window",
             ),
         });
 

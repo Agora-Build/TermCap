@@ -49,6 +49,15 @@ newlines need no escaping.
 extent and nothing older; iTerm2 exposes only its latest prompt. `-c 2` on those must fail
 with a pointer to tmux, never return the wrong block.
 
+**kitty has three traps, all found in the field rather than by tests.** `get-text` must be
+asked for `last_non_empty_output`, not `last_cmd_output`: kitty counts the running `tcap` as
+the current command, so the latter returns tcap's own empty output. `--match id:$KITTY_WINDOW_ID`
+is required or kitty reads the *focused* window, which need not be the one tcap runs in — and
+`--match` is a `get-text` option, so it must follow the subcommand. Remote control works over
+either the escape-code channel or `--to $KITTY_LISTEN_ON`; under `allow_remote_control
+socket-only` only the socket works, so the error must advise `listen_on`, not
+`allow_remote_control yes`.
+
 ## Verification status
 
 - **tmux** — fully working, covered by end-to-end tests.

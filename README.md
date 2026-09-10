@@ -152,10 +152,18 @@ its scrollback returns tmux's *rendered viewport*, not the shell's real history 
 and tmux swallows the prompt marks kitty's `last_cmd_output` depends on. So tmux
 is always treated as authoritative when it is in the stack.
 
-**Only tmux can reach past the most recent command.** kitty exposes a
-`last_cmd_output` extent and nothing for older commands; iTerm2 exposes only its
-latest prompt. `tcap -c 2` therefore fails with a pointer to tmux rather than
-silently returning the wrong block.
+**Only tmux can reach past the most recent command.** kitty exposes only the
+latest output and nothing older; iTerm2 exposes only its latest prompt. `tcap -c
+2` therefore fails with a pointer to tmux rather than silently returning the
+wrong block.
+
+**On kitty, output is the last *non-empty* output.** kitty counts the running
+`tcap` as the current command, so it has to be asked for the last output that
+wasn't empty. The consequence: if your last command printed nothing, kitty
+returns an *older* command's output while the header names the last one. tmux has
+no such ambiguity, because the shell hook records real boundaries. kitty also
+needs remote control reachable — either `allow_remote_control yes`, or
+`socket-only` together with `listen_on unix:/tmp/kitty-{kitty_pid}`.
 
 When something is missing, `tcap` says what and why:
 
