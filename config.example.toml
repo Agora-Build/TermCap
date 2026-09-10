@@ -1,0 +1,24 @@
+# tcap configuration — copy to ~/.config/tcap/config.toml
+#
+# Every key is optional and sets a default only: flags > environment > this file
+# > built-in defaults. Override the location with $TCAP_CONFIG, and check what
+# actually loaded with `tcap doctor`. An unknown key is an error, not a no-op.
+
+# One of: tmux, kitty, wezterm, iterm2
+# Leave unset unless detection picks the wrong one — the default order exists
+# because tmux must win whenever it is running, the outer terminal being able to
+# see only tmux's rendered viewport rather than the shell's scrollback.
+# backend = "tmux"
+
+# Byte budget before the middle of the output is elided. 0 for unlimited.
+# max_bytes = 64000
+
+# One of: annotated (default), output, command, raw, json
+# format = "annotated"
+
+# Silence the stderr hints that explain a missing exit code or command. Worth
+# setting only once everything is wired up; --no-quiet escapes it for one run.
+# quiet = false
+
+# Always copy to the clipboard as well as printing. --no-copy escapes it.
+# copy = false
