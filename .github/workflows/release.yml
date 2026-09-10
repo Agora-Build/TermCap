@@ -1,0 +1,182 @@
+# Tag-driven release: push vX.Y.Z -> build prebuilt tcap binaries for the four
+# supported targets, publish a GitHub Release, the npm wrapper, and mirror to
+# Cloudflare R2 (dl.agora.build).
+#
+# tcap is a dependency-free static-ish Rust binary, so there is nothing to bundle
+# alongside it — the tarball holds the executable and nothing else. Linux
+# aarch64 is cross-compiled on the x86_64 runner.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Never ship a tag that cannot pass its own test suite.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: darwin-aarch64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            artifact: darwin-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # Keep the binary's --version in step with the tag it shipped under.
+          perl -0pi -e "s/^version = \"[^\"]+\"/version = \"$VERSION\"/m" Cargo.toml
+
+      - name: Linux cross deps
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage tarball
+        shell: bash
+        run: |
+          stage="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/tcap" "$stage/tcap"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "$stage/tcap" || true
+          else
+            strip "$stage/tcap" || true
+          fi
+          # Flat layout: the tarball contains the bare executable, so both
+          # install.sh and the npm postinstall can extract straight into a bindir.
+          tar -czf "tcap-${VERSION}-${{ matrix.artifact }}.tar.gz" -C "$stage" tcap
+          shasum -a 256 "tcap-${VERSION}-${{ matrix.artifact }}.tar.gz" \
+            > "tcap-${VERSION}-${{ matrix.artifact }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcap-${{ matrix.artifact }}
+          path: |
+            tcap-*.tar.gz
+            tcap-*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/tcap-*.tar.gz
+            dist/tcap-*.tar.gz.sha256
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Set npm version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e "const f='npm/package.json',p=require('./'+f);p.version='$VERSION';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  r2-mirror:
+    name: Mirror to Cloudflare R2 (dl.agora.build)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Upload tarballs + install script to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          npm i -g wrangler
+          VERSION="${GITHUB_REF_NAME}"
+          # Shared releases bucket for all Agora-Build CLIs; dl.agora.build fronts it.
+          # Per-project key prefix (tcap/…) keeps projects separate.
+          BUCKET="agora-build-releases"
+
+          for f in dist/tcap-*.tar.gz dist/tcap-*.tar.gz.sha256; do
+            [ -e "$f" ] || continue
+            KEY="tcap/releases/${VERSION}/$(basename "$f")"
+            echo "Uploading $KEY"
+            wrangler r2 object put "$BUCKET/$KEY" --file="$f" --remote
+          done
+
+          # 'latest' version marker (plain text, no 'v' prefix)
+          echo -n "${VERSION#v}" | wrangler r2 object put "$BUCKET/tcap/releases/latest" \
+            --pipe --content-type text/plain --remote
+
+          # Stable aliases that always point at the newest build.
+          for f in dist/tcap-*.tar.gz; do
+            [ -e "$f" ] || continue
+            # strip version: tcap-0.1.0-darwin-aarch64.tar.gz -> tcap-darwin-aarch64.tar.gz
+            stable="$(basename "$f" | sed -E 's/tcap-[0-9]+\.[0-9]+\.[0-9]+-/tcap-/')"
+            wrangler r2 object put "$BUCKET/tcap/latest/$stable" --file="$f" --remote
+          done
+
+          # install script -> https://dl.agora.build/tcap/install.sh
+          wrangler r2 object put "$BUCKET/tcap/install.sh" \
+            --file=scripts/install.sh --content-type text/plain --remote

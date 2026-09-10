@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Gate every push on the same checks CI runs, so a red build is caught here
+# rather than five minutes later in Actions.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a genuine emergency:
+#   git push --no-verify
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+say() { printf '\033[1;36mpre-push:\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31mpre-push failed:\033[0m %s\n' "$*" >&2; exit 1; }
+
+say "cargo fmt --check"
+cargo fmt --check || fail "formatting — run \`cargo fmt\`"
+
+say "cargo clippy"
+cargo clippy --all-targets -- -D warnings || fail "clippy"
+
+# The tmux end-to-end tests skip themselves when tmux is missing, so this is
+# safe to run anywhere; it just covers less.
+if ! command -v tmux >/dev/null 2>&1; then
+  say "note: tmux not found — end-to-end tests will skip"
+fi
+
+say "cargo test"
+cargo test || fail "tests"
+
+say "all checks passed"

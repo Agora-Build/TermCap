@@ -1,0 +1,5 @@
+#!/bin/sh
+# Placeholder, replaced by install.js with the real binary on postinstall.
+echo "tcap: binary not installed. Run 'npm rebuild @agora-build/tcap'," >&2
+echo "tcap: or: curl -fsSL https://dl.agora.build/tcap/install.sh | bash" >&2
+exit 1

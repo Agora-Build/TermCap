@@ -1,0 +1,47 @@
+{
+  "name": "@agora-build/tcap",
+  "version": "0.1.0",
+  "description": "Capture the last command and its output from your terminal, ready to pipe into an LLM",
+  "bin": {
+    "tcap": "bin/tcap"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Agora-Build/TermCap.git"
+  },
+  "keywords": [
+    "terminal",
+    "scrollback",
+    "capture",
+    "tmux",
+    "kitty",
+    "iterm2",
+    "llm",
+    "cli"
+  ],
+  "author": "Agora Build <build@agora.io>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Agora-Build/TermCap/issues"
+  },
+  "homepage": "https://github.com/Agora-Build/TermCap#readme",
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

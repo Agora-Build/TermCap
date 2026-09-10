@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The end-to-end suite drives a real tmux session. Without tmux those
+      # tests skip themselves, which would quietly gut the most valuable
+      # coverage we have — so install it rather than letting them no-op.
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y tmux
+          else
+            brew install tmux || true
+          fi
+          tmux -V
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # Guards the claim in the README that these are the supported extents.
+      - name: Smoke test the CLI
+        run: |
+          cargo build
+          ./target/debug/tcap --help
+          ./target/debug/tcap init zsh > /dev/null
+          ./target/debug/tcap init bash > /dev/null
+          ./target/debug/tcap init fish > /dev/null
+          # Outside any supported terminal this must fail with guidance, not panic.
+          if ./target/debug/tcap 2>err.txt; then
+            echo "expected failure outside a supported terminal" && exit 1
+          fi
+          grep -q "tcap doctor" err.txt || { echo "error text lost its guidance:"; cat err.txt; exit 1; }
