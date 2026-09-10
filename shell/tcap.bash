@@ -65,7 +65,13 @@ else
     (( _tcap_armed )) && return 0
     _tcap_armed=1
 
-    _tcap_begin "$BASH_COMMAND"
+    # $BASH_COMMAND is only the current *simple* command, so `make; echo done`
+    # would record just `make`. The history entry is the whole line as typed.
+    local hist num line
+    hist=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+    [[ -n "$hist" ]] && builtin read -r num line <<< "$hist"
+
+    _tcap_begin "${line:-$BASH_COMMAND}"
   }
 
   _tcap_precmd() {
@@ -75,11 +81,13 @@ else
     _tcap_finish "$ec"
   }
 
-  trap '_tcap_debug' DEBUG
-
   # Prepend, so the status we read is the command's and not another hook's.
   case ";${PROMPT_COMMAND};" in
     *";_tcap_precmd;"*) ;;
     *) PROMPT_COMMAND="_tcap_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
   esac
+
+  # Armed last, so nothing above is caught by our own trap and recorded as if
+  # the user had typed it.
+  trap '_tcap_debug' DEBUG
 fi
