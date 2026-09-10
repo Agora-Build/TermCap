@@ -27,17 +27,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The end-to-end suite drives a real tmux session. Without tmux those
-      # tests skip themselves, which would quietly gut the most valuable
-      # coverage we have — so install it rather than letting them no-op.
-      - name: Install tmux
+      # The end-to-end suite drives real shells under tmux. zsh is installed
+      # explicitly so the zsh integration is covered on Linux too; without it
+      # the runner has only bash and half the shell code goes untested.
+      - name: Install tmux and zsh
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
+            sudo apt-get update && sudo apt-get install -y tmux zsh
           else
             brew install tmux || true
           fi
-          tmux -V
+          tmux -V && zsh --version
 
       - name: Format
         run: cargo fmt --check

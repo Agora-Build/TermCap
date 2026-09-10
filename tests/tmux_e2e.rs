@@ -25,12 +25,103 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Run tmux, failing loudly on a non-zero exit.
+///
+/// The unchecked version of this silently returned an empty string, which turned
+/// every tmux problem into an indistinguishable "saw 0 recorded commands"
+/// timeout with a blank pane dump.
 fn tmux(args: &[&str]) -> String {
     let out = Command::new("tmux")
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("running tmux {args:?}: {e}"));
+    if !out.status.success() {
+        panic!(
+            "tmux {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// For commands whose failure is expected and uninteresting, e.g. killing a
+/// session that was never created.
+fn tmux_quiet(args: &[&str]) {
+    let _ = Command::new("tmux").args(args).output();
+}
+
+fn which(program: &str) -> Option<String> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Shells with a tcap integration worth exercising.
+///
+/// The integrations are not interchangeable — zsh uses `add-zsh-hook`, bash a
+/// DEBUG trap — so assuming zsh broke every test at once on CI, where the
+/// default shell is bash and the zsh init failed with `add-zsh-hook: command
+/// not found`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shell {
+    Zsh,
+    /// bash as the user actually has it, rc files and all.
+    Bash,
+    /// bash with no rc files, which is what CI runners give you.
+    ///
+    /// Worth testing separately because it decides which branch of the bash
+    /// integration runs: with rc files this machine loads bash-preexec and we
+    /// register into its hook arrays; without them we install our own DEBUG
+    /// trap. Both occur in the wild, and only one of them runs on CI.
+    BashBare,
+}
+
+impl Shell {
+    /// The name passed to `tcap init`.
+    fn name(self) -> &'static str {
+        match self {
+            Shell::Zsh => "zsh",
+            Shell::Bash | Shell::BashBare => "bash",
+        }
+    }
+
+    /// Label for assertion messages, distinguishing the two bash variants.
+    fn label(self) -> &'static str {
+        match self {
+            Shell::Zsh => "zsh",
+            Shell::Bash => "bash",
+            Shell::BashBare => "bash --norc",
+        }
+    }
+
+    fn binary(self) -> Option<String> {
+        which(self.name())
+    }
+
+    /// The command tmux should run for the pane.
+    fn command(self) -> Option<Vec<String>> {
+        let bin = self.binary()?;
+        Some(match self {
+            Shell::BashBare => vec![bin, "--norc".into(), "--noprofile".into()],
+            _ => vec![bin],
+        })
+    }
+}
+
+fn available_shells() -> Vec<Shell> {
+    [Shell::Zsh, Shell::Bash, Shell::BashBare]
+        .into_iter()
+        .filter(|s| s.binary().is_some())
+        .collect()
+}
+
+/// Preferred shell for the bulk of the suite; zsh when present.
+fn primary_shell() -> Shell {
+    *available_shells()
+        .first()
+        .expect("neither zsh nor bash found on PATH")
 }
 
 /// A disposable tmux session with tcap's shell integration loaded.
@@ -41,23 +132,33 @@ struct Session {
 
 impl Session {
     fn new(name: &str) -> Self {
+        Self::with_shell(name, primary_shell())
+    }
+
+    fn with_shell(name: &str, shell: Shell) -> Self {
         let dir = std::env::temp_dir().join(format!("tcap-e2e-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Isolate this session's state so tests never see each other's history.
-        let _ = tmux(&["kill-session", "-t", name]);
-        tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-x",
-            "160",
-            "-y",
-            "50",
-            "-e",
-            &format!("TMPDIR={}", dir.display()),
-        ]);
+        tmux_quiet(&["kill-session", "-t", name]);
+        // The shell is explicit rather than inherited from $SHELL, which is zsh
+        // on a dev machine and bash on CI. The integrations are not
+        // interchangeable, so inheriting silently installed nothing.
+        let tmpdir = format!("TMPDIR={}", dir.display());
+        let mut args: Vec<String> = vec![
+            "new-session".into(),
+            "-d".into(),
+            "-s".into(),
+            name.into(),
+            "-x".into(),
+            "160".into(),
+            "-y".into(),
+            "50".into(),
+            "-e".into(),
+            tmpdir,
+        ];
+        args.extend(shell.command().expect("shell binary vanished"));
+        tmux(&args.iter().map(String::as_str).collect::<Vec<_>>());
 
         let s = Self {
             name: name.to_string(),
@@ -67,8 +168,9 @@ impl Session {
 
         let bin_dir = PathBuf::from(BIN).parent().unwrap().to_path_buf();
         s.send(&format!(
-            "export PATH=\"{}:$PATH\"; eval \"$(tcap init zsh)\"; clear",
-            bin_dir.display()
+            "export PATH=\"{}:$PATH\"; eval \"$(tcap init {})\"; clear",
+            bin_dir.display(),
+            shell.name(),
         ));
 
         // The hook is installed *during* that line, so its own preexec never
@@ -164,7 +266,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = tmux(&["kill-session", "-t", &self.name]);
+        tmux_quiet(&["kill-session", "-t", &self.name]);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -215,6 +317,42 @@ fn captures_the_last_command_with_its_metadata_and_exact_output() {
         body.starts_with("> tsc"),
         "output should begin at the first line the command printed:\n{body:?}"
     );
+}
+
+/// Every shell integration must actually record, not just zsh's.
+///
+/// zsh uses `add-zsh-hook`; bash uses a DEBUG trap with a latch and its own
+/// `$?` handling. Only zsh was covered until CI — which runs bash — failed every
+/// end-to-end test at once.
+#[test]
+fn every_available_shell_integration_records() {
+    skip_without_tmux!();
+
+    let shells = available_shells();
+    assert!(!shells.is_empty(), "no shell available to test");
+
+    for shell in shells {
+        let s = Session::with_shell(&format!("tcap-e2e-shell-{shell:?}"), shell);
+
+        s.run(r#"sh -c 'echo shell_probe; exit 2'"#);
+        let out = s.tcap("");
+
+        let ctx = shell.label();
+        assert!(out.contains("exit: 2"), "{ctx}: exit code missing:\n{out}");
+        assert!(out.contains("shell_probe"), "{ctx}: output missing:\n{out}");
+        assert!(
+            out.contains("shell_probe; exit 2"),
+            "{ctx}: command text missing:\n{out}"
+        );
+
+        // Indexing depends on the hook recording every command, not just the last.
+        s.run("echo second");
+        let prev = s.tcap("-c 2");
+        assert!(
+            prev.contains("shell_probe"),
+            "{ctx}: -c 2 did not reach the earlier command:\n{prev}"
+        );
+    }
 }
 
 /// A successful command still reports `exit: 0` — the model needs to know the
