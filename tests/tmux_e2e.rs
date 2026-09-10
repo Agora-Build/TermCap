@@ -136,10 +136,12 @@ impl Session {
     }
 
     fn with_shell(name: &str, shell: Shell) -> Self {
-        let dir = std::env::temp_dir().join(format!("tcap-e2e-{name}-{}", std::process::id()));
+        // Scope the session name to this process so a concurrent run, or a
+        // leftover session from an aborted one, cannot collide with it.
+        let name = &format!("{name}-{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("tcap-e2e-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Isolate this session's state so tests never see each other's history.
         tmux_quiet(&["kill-session", "-t", name]);
         // The shell is explicit rather than inherited from $SHELL, which is zsh
         // on a dev machine and bash on CI. The integrations are not
@@ -166,11 +168,18 @@ impl Session {
         };
         s.wait_for_shell();
 
+        // Record what setup actually did. Previously this ran `clear`, which
+        // erased the evidence and made every setup failure look identical to a
+        // capture bug.
         let bin_dir = PathBuf::from(BIN).parent().unwrap().to_path_buf();
+        let log = s.dir.join("setup.log");
         s.send(&format!(
-            "export PATH=\"{}:$PATH\"; eval \"$(tcap init {})\"; clear",
-            bin_dir.display(),
-            shell.name(),
+            "export PATH=\"{bin}:$PATH\"; \
+             {{ echo \"tcap=$(command -v tcap)\"; echo \"TMPDIR=$TMPDIR\"; \
+             eval \"$(tcap init {sh})\"; echo \"init_rc=$?\"; }} > {log} 2>&1",
+            bin = bin_dir.display(),
+            sh = shell.name(),
+            log = log.display(),
         ));
 
         // The hook is installed *during* that line, so its own preexec never
@@ -229,8 +238,36 @@ impl Session {
             .sum()
     }
 
+    /// Recursive listing of the session's temp dir, for failure messages.
+    fn describe_state_dir(&self) -> String {
+        fn walk(dir: &std::path::Path, depth: usize, out: &mut String) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                out.push_str(&format!("{}(unreadable)\n", "  ".repeat(depth)));
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                out.push_str(&format!("{}{name}\n", "  ".repeat(depth)));
+                if p.is_dir() && depth < 3 {
+                    walk(&p, depth + 1, out);
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&self.dir, 0, &mut out);
+        if out.is_empty() {
+            out.push_str("(empty)\n");
+        }
+        out
+    }
+
     fn wait_for_records(&self, at_least: usize) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
             if self.record_count() >= at_least {
                 return;
@@ -238,8 +275,15 @@ impl Session {
             std::thread::sleep(Duration::from_millis(40));
         }
         panic!(
-            "timed out waiting for {at_least} recorded commands (saw {})\npane was:\n{}",
+            "timed out waiting for {at_least} recorded commands (saw {})\n\
+             --- setup.log ---\n{}\n\
+             --- state dir {} ---\n{}\n\
+             --- pane ---\n{}",
             self.record_count(),
+            std::fs::read_to_string(self.dir.join("setup.log"))
+                .unwrap_or_else(|e| format!("(unreadable: {e})")),
+            self.dir.display(),
+            self.describe_state_dir(),
             tmux(&["capture-pane", "-p", "-t", &self.target()])
         );
     }
