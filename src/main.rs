@@ -129,19 +129,36 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         ));
     }
 
+    // Unfiltered: nth_from_end skips tcap invocations, but here we need to know
+    // whether tcap itself ran most recently.
+    let after_tcap = records
+        .last()
+        .map(|r| state::is_tcap_invocation(&r.command))
+        .unwrap_or(false);
+
+    // Refuse rather than emit, in the one case where the output is known to be
+    // wrong: a boundary-less backend returns the last non-empty output, and
+    // after a previous tcap that is the previous capture. Printing it first and
+    // warning afterwards is no use in `tcap --output | some-service`, where the
+    // text has already left by the time stderr is read. Where the mismatch is
+    // only possible rather than certain, the capture proceeds and is labelled.
+    if after_tcap && caps.iter().any(|c| c.approximate) && mode != cli::Mode::Command {
+        return Err(anyhow!(
+            "refusing to capture: the previous command was tcap itself, and {} can only\n\
+             report the last non-empty output — which is that capture, not a command.\n\n\
+             Re-run the command you want to capture, then tcap. Inside tmux this is not\n\
+             a limitation, because the shell hook records exact boundaries.",
+            backend.name()
+        ));
+    }
+
     render::prepare(&mut caps, mode, &cli.select, settings.max_bytes);
     let text = render::render(&caps, mode);
 
     println!("{text}");
 
     if !settings.quiet {
-        // Unfiltered: nth_from_end skips tcap invocations, but for this warning
-        // we need to know whether tcap itself ran most recently.
-        let after_tcap = records
-            .last()
-            .map(|r| state::is_tcap_invocation(&r.command))
-            .unwrap_or(false);
-        emit_hints(&caps, backend.as_ref(), mode, after_tcap);
+        emit_hints(&caps, backend.as_ref(), mode);
     }
 
     if settings.copy {
@@ -153,32 +170,21 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
 
 /// Warn about degraded captures, naming the cause and the fix. Goes to stderr
 /// so `tcap | sgpt` still pipes clean text.
-fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode, after_tcap: bool) {
-    // Backends without real command boundaries return the last *non-empty*
-    // output. tcap's own output is non-empty, so a capture straight after
-    // another one hands back the previous capture rather than a command.
-    // Every mode, not just annotated: --output and --raw are the ones piped
-    // into another tool, so they are exactly where silently handing over an
-    // earlier command's text does the most damage. stderr keeps the pipe clean,
-    // and --quiet still silences it.
-    if caps.iter().any(|c| c.approximate) {
-        if after_tcap {
-            eprintln!(
-                "tcap: the previous command was tcap itself, and {} can only report the\n\
-                 \x20 last non-empty output — so this is most likely the previous capture's\n\
-                 \x20 own output, or whatever its pipeline printed, rather than a command's.\n\
-                 \x20 Re-run the command you meant to capture, or use tmux, which records\n\
-                 \x20 exact boundaries.",
-                backend.name()
-            );
-        } else {
-            eprintln!(
-                "tcap: {} returns the last non-empty output, so if the command named above\n\
-                 \x20 printed nothing this is an earlier command's output. tmux records\n\
-                 \x20 exact boundaries; --quiet silences this.",
-                backend.name()
-            );
-        }
+fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) {
+    // Every mode but Command: --output and --raw are the ones piped into another
+    // tool, so they are where handing over an earlier command's text does the
+    // most damage. Command mode renders the shell's own record, which is exact,
+    // and never prints the terminal text this warning is about.
+    //
+    // The *certain* mismatch — a capture straight after another one — does not
+    // reach here at all; capture_and_print refuses it outright.
+    if mode != cli::Mode::Command && caps.iter().any(|c| c.approximate) {
+        eprintln!(
+            "tcap: {} returns the last non-empty output, so if the command named above\n\
+             \x20 printed nothing this is an earlier command's output. tmux records\n\
+             \x20 exact boundaries; --quiet silences this.",
+            backend.name()
+        );
     }
 
     // Only the annotated view promises metadata, so only it can disappoint.

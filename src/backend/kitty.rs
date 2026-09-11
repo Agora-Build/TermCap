@@ -104,17 +104,31 @@ impl Kitty {
         // macOS $TMPDIR is already per-user and 0700; $XDG_RUNTIME_DIR is the
         // equivalent on Linux.
         let dir = if cfg!(target_os = "macos") {
-            "${TMPDIR}"
+            // Already per-user and 0700.
+            Some("${TMPDIR}".to_string())
         } else {
-            "${XDG_RUNTIME_DIR}"
+            // Only when it is actually set: it is a systemd convention, absent
+            // on non-systemd distros, in containers and under some su/ssh paths,
+            // where it would expand to nothing and put the socket at /.
+            std::env::var("XDG_RUNTIME_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|_| "${XDG_RUNTIME_DIR}".to_string())
         };
+
+        let line = match &dir {
+            Some(d) => format!("  listen_on unix:{d}/kitty-{{kitty_pid}}"),
+            None => "  listen_on unix:/run/user/$(id -u)/kitty-{kitty_pid}   <- or any \
+                 directory only you can open; $XDG_RUNTIME_DIR is unset here"
+                .to_string(),
+        };
+
         format!(
-            "  allow_remote_control socket-only\n  \
-             listen_on unix:{dir}/kitty-{{kitty_pid}}\n\
-             Keep the socket somewhere only you can open — the path above already is. \
-             One in /tmp is reachable by anyone with write permission on it, which under \
-             a group-writable umask is more than just you. Note kitty.conf has no trailing \
-             comments: everything after the value is part of it."
+            "  allow_remote_control socket-only\n{line}\n\
+             Keep the socket in a directory only you can open. One in /tmp is reachable by \
+             anyone with write permission on it, which under a group-writable umask is more \
+             than just you. Note kitty.conf has no trailing comments: everything after the \
+             value is part of it."
         )
     }
 
@@ -139,6 +153,15 @@ impl Kitty {
                  remote control at all. If you would rather use a socket:\n{}",
                 Self::socket_advice()
             );
+        }
+
+        if msg.contains("no matching") || msg.contains("no window") {
+            return "kitty could not find the window tcap asked for.\n\
+                 $KITTY_LISTEN_ON probably points at a different kitty instance — a \
+                 `listen_on` without {kitty_pid} is shared between instances, so window ids \
+                 from one do not exist in another. Give each instance its own socket:\n"
+                .to_string()
+                + &Self::socket_advice();
         }
 
         // Checked after `password`, so a password refusal that happens to name
@@ -167,15 +190,6 @@ impl Kitty {
             };
         }
 
-        if msg.contains("no matching") || msg.contains("no window") {
-            return "kitty could not find the window tcap asked for.\n\
-                 $KITTY_LISTEN_ON probably points at a different kitty instance — a \
-                 `listen_on` without {kitty_pid} is shared between instances, so window ids \
-                 from one do not exist in another. Give each instance its own socket:\n"
-                .to_string()
-                + &Self::socket_advice();
-        }
-
         format!(
             "If this is a remote-control problem, kitty needs it enabled. In \
              ~/.config/kitty/kitty.conf either:\n  allow_remote_control yes\nor keep it \
@@ -196,6 +210,11 @@ impl Kitty {
     /// The guarantee is bounded: `id:N` is instance-local, so it identifies this
     /// window within whichever instance `--to` reaches. A stale or shared
     /// $KITTY_LISTEN_ON could still point at a different instance.
+    ///
+    /// `--match state:self` was measured as an alternative and rejected: it
+    /// resolves the invoking window correctly even when unfocused, but still
+    /// fails without $KITTY_WINDOW_ID ("No matching windows for expression:
+    /// state:self"), so it hides the same dependency behind a worse message.
     ///
     /// The id is parsed as a number so a poisoned variable cannot widen the
     /// match expression, and so a malformed one is reported as such instead of
@@ -276,9 +295,22 @@ impl Backend for Kitty {
         let window = Self::require_window()?;
         let args = self.get_text_args(&listen_on, &window, raw);
 
-        run(&self.exe, &args)
-            .map(Fetched::from)
-            .map_err(|e| anyhow!("{e}\n\n{}", Self::remote_control_hint(&e, &listen_on)))
+        let text = run(&self.exe, &args)
+            .map_err(|e| anyhow!("{e}\n\n{}", Self::remote_control_hint(&e, &listen_on)))?;
+
+        // `run` succeeding with an empty body would render as a bare header with
+        // nothing under it — the exact symptom this backend was fixed for — so
+        // it fails with the same explanation doctor gives.
+        if text.trim().is_empty() {
+            return Err(anyhow!(
+                "kitty returned no output for this window.\n\n\
+                 Nothing has printed here yet, or kitty's own shell integration is off.\n\
+                 Run a command that prints something and try again; if it stays empty,\n\
+                 check `shell_integration` in ~/.config/kitty/kitty.conf."
+            ));
+        }
+
+        Ok(Fetched::from(text))
     }
 
     fn diagnose(&self) -> Vec<Diagnostic> {
