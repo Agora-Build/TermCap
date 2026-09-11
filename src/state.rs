@@ -63,6 +63,20 @@ pub fn take_capture_marker() -> bool {
     fs::remove_file(marker_path()).is_ok()
 }
 
+/// True the first time it is asked for `key` in this session.
+///
+/// A caveat that is always true — kitty can never attribute output to a command
+/// — says nothing when repeated on every capture, and trains the reader to skip
+/// it. Said once, it still lands.
+pub fn first_time(key: &str) -> bool {
+    let path = state_dir().join(format!("{}.said-{key}", session_key()));
+    if fs::symlink_metadata(&path).is_ok() {
+        return false;
+    }
+    // If the note cannot be recorded, saying it again is the safer failure.
+    secure_write(&path, b"1").is_ok()
+}
+
 /// Why the state directory is unusable, if it is.
 ///
 /// `load` failing closed to an empty history also switches off the guard that

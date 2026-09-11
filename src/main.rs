@@ -246,12 +246,16 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode)
     //
     // The *certain* mismatch — a capture straight after another one — does not
     // reach here at all; capture_and_print refuses it outright.
-    if mode != cli::Mode::Command && caps.iter().any(|c| c.approximate) {
+    // Once per session, and one line. This is true of *every* kitty capture, so
+    // repeating it on each one is noise that buries the hints that are specific
+    // — and `tcap | llm` is the workflow it interrupted most.
+    if mode != cli::Mode::Command
+        && caps.iter().any(|c| c.approximate)
+        && state::first_time("approximate")
+    {
         eprintln!(
-            "tcap: {} returns the last non-empty output, which may not belong to the\n\
-             \x20 command named above — a silent command yields an earlier one's output,\n\
-             \x20 and a previous `tcap | …` leaves its pipeline's. tmux records exact\n\
-             \x20 boundaries; --quiet silences this.",
+            "tcap: {} cannot tie output to a command, so this may be an earlier one's \
+             — see `tcap doctor`. Shown once per session; --quiet silences it.",
             backend.name()
         );
         printed = true;

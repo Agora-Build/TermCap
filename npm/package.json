@@ -1,6 +1,6 @@
 {
   "name": "@agora-build/tcap",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Capture the last command and its output from your terminal, ready to pipe into an LLM",
   "bin": {
     "tcap": "bin/tcap"

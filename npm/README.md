@@ -112,8 +112,9 @@ block.
 
 **On kitty, output is the last *non-empty* output**, because kitty counts the
 running `tcap` as the current command. A command that printed nothing therefore
-yields an older output under the current header; it is labelled with a `# note:`
-line and `"approximate": true` in `--json`. Two `tcap` runs in a row are a hard
+yields an older output under the current header; it is labelled with a `# note:` line and
+`"approximate": true` in `--json`, plus a one-line stderr reminder once per
+session. Two `tcap` runs in a row are a hard
 error instead, since the mismatch is certain there. tmux has no such ambiguity.
 
 **tmux wins whenever it's running.** Inside kitty running tmux, asking kitty for
