@@ -185,8 +185,9 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     // only possible rather than certain, the capture proceeds and is labelled.
     if after_tcap && caps.iter().any(|c| c.approximate) && mode != cli::Mode::Command {
         return Err(anyhow!(
-            "refusing to capture: the previous command was tcap itself, and {} can only\n\
-             report the last non-empty output — which is that capture, not a command.\n\n\
+            "refusing to capture: the previous command left tcap's own output on screen,\n\
+             and {} can only report the last non-empty output — which is that text, not\n\
+             a command's. (It may have been tcap directly, or a script that called it.)\n\n\
              Re-run the command you want to capture, then tcap. Inside tmux this is not\n\
              a limitation, because the shell hook records exact boundaries.",
             backend.name()
@@ -225,9 +226,10 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode)
     // reach here at all; capture_and_print refuses it outright.
     if mode != cli::Mode::Command && caps.iter().any(|c| c.approximate) {
         eprintln!(
-            "tcap: {} returns the last non-empty output, so if the command named above\n\
-             \x20 printed nothing this is an earlier command's output. tmux records\n\
-             \x20 exact boundaries; --quiet silences this.",
+            "tcap: {} returns the last non-empty output, which may not belong to the\n\
+             \x20 command named above — a silent command yields an earlier one's output,\n\
+             \x20 and a previous `tcap | …` leaves its pipeline's. tmux records exact\n\
+             \x20 boundaries; --quiet silences this.",
             backend.name()
         );
         printed = true;

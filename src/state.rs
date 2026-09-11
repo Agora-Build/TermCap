@@ -142,6 +142,17 @@ fn secure_read(path: &Path) -> Option<String> {
     Some(buf)
 }
 
+/// Write a file under the state directory with the same protections.
+pub fn secure_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    secure_open(path)?.write_all(bytes)?;
+    Ok(())
+}
+
+/// Read a file under the state directory with the same protections.
+pub fn secure_read_file(path: &Path) -> Option<String> {
+    secure_read(path)
+}
+
 /// Open a state file for writing without following symlinks.
 fn secure_open(path: &Path) -> Result<fs::File> {
     ensure_state_dir()?;

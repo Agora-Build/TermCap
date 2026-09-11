@@ -131,7 +131,8 @@ fn header(cap: &Capture) -> String {
     // Usually the same thing; when the last command printed nothing, not.
     if cap.approximate {
         s.push_str(&format!(
-            "# note: {} returns the last non-empty output — it may be an earlier command's\n",
+            "# note: {} returns the last non-empty output, which may not be this \
+             command's\n",
             cap.source
         ));
     }
