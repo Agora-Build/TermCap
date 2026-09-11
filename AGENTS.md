@@ -58,6 +58,17 @@ either the escape-code channel or `--to $KITTY_LISTEN_ON`; under `allow_remote_c
 socket-only` only the socket works, so the error must advise `listen_on`, not
 `allow_remote_control yes`.
 
+**The capture marker records that tcap's own text reached the screen**, so the next capture on
+a boundary-less backend can refuse rather than return it. It is written only where captured
+*content* is printed — not for hints or errors, which are not that text, and marking those made
+`tcap --output | llm` refuse the following capture, with the outcome flipping on `--quiet`.
+
+One case it cannot see: `tcap --output | llm` pipes tcap's stdout, but the downstream tool
+writes its answer to the terminal, so kitty's last non-empty output is that answer with no
+marker set. The next capture proceeds and is labelled approximate rather than refused. tcap
+cannot observe what a downstream process printed, so this is a limitation to state, not a check
+to add.
+
 ## Verification status
 
 - **tmux** — fully working, covered by end-to-end tests.

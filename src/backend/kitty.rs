@@ -308,7 +308,9 @@ impl Backend for Kitty {
         // `run` succeeding with an empty body would render as a bare header with
         // nothing under it — the exact symptom this backend was fixed for — so
         // it fails with the same explanation doctor gives.
-        if text.trim().is_empty() {
+        // Only newlines count as nothing: `printf '   \n'` is real output, and
+        // --raw/--output promise the exact bytes.
+        if text.chars().all(|c| c == '\n' || c == '\r') {
             return Err(anyhow!(
                 "kitty returned no output for this window.\n\n\
                  Nothing has printed here yet, or kitty's own shell integration is off.\n\

@@ -400,6 +400,19 @@ mod tests {
         assert_eq!(nth_from_end(&records, 2).unwrap().command, "npm run build");
     }
 
+    /// The marker decides whether a capture is refused outright, and nothing
+    /// exercised the file itself.
+    #[test]
+    fn capture_marker_round_trips_and_is_consumed_once() {
+        // session_key is ppid-based, so clear any stray marker first.
+        let _ = take_capture_marker();
+
+        assert!(!take_capture_marker(), "no marker to begin with");
+        mark_capture().expect("marker should be writable");
+        assert!(take_capture_marker(), "the marker is seen once");
+        assert!(!take_capture_marker(), "and only once — it is consumed");
+    }
+
     #[test]
     fn nth_returns_none_past_the_start_of_history() {
         assert!(nth_from_end(&[], 1).is_none());

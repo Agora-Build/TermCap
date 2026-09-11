@@ -21,8 +21,9 @@ use state::Record;
 
 fn main() {
     if let Err(e) = run() {
+        // Deliberately unmarked: an error message is not captured text, and
+        // marking it would make a failed `tcap -c 2` poison the next capture.
         eprintln!("tcap: {e:#}");
-        mark_if_stderr_is_terminal();
         std::process::exit(1);
     }
 }
@@ -37,12 +38,6 @@ fn main() {
 /// `--help` exits before any of it runs.
 fn mark_if_stdout_is_terminal() {
     if std::io::stdout().is_terminal() {
-        warn_if_unmarked(state::mark_capture());
-    }
-}
-
-fn mark_if_stderr_is_terminal() {
-    if std::io::stderr().is_terminal() {
         warn_if_unmarked(state::mark_capture());
     }
 }
@@ -66,9 +61,10 @@ fn run() -> Result<()> {
         Err(e) => {
             // --help and --version print to stdout, usage errors to stderr.
             let _ = e.print();
-            if e.use_stderr() {
-                mark_if_stderr_is_terminal();
-            } else {
+            // --help and --version put a screenful on stdout, which does become
+            // the last output. Usage errors go to stderr and are not marked, for
+            // the same reason other diagnostics are not.
+            if !e.use_stderr() {
                 mark_if_stdout_is_terminal();
             }
             std::process::exit(e.exit_code());
@@ -224,9 +220,11 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     println!("{text}");
     mark_if_stdout_is_terminal();
 
-    if !settings.quiet && emit_hints(&caps, backend.as_ref(), mode) {
-        // The hint itself is now the screen's last output.
-        mark_if_stderr_is_terminal();
+    if !settings.quiet {
+        // Not marked: a one-line diagnostic is not the captured text this guard
+        // is about. Marking it made `tcap --output | llm` refuse the *next*
+        // capture — and flipped that outcome on whether --quiet was passed.
+        emit_hints(&caps, backend.as_ref(), mode);
     }
 
     if settings.copy {
