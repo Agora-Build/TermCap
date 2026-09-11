@@ -32,13 +32,13 @@ actually failed, rather than making it guess from the text.
 ## Install
 
 ```sh
-curl -fsSL https://dl.agora.build/tcap/install.sh | bash
+npm i -g @agora-build/tcap
 ```
 
-or
+Or without Node:
 
 ```sh
-npm i -g @agora-build/tcap
+curl -fsSL https://dl.agora.build/tcap/install.sh | bash
 ```
 
 Then enable shell integration and open a new terminal:
