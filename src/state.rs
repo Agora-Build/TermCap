@@ -53,13 +53,23 @@ fn marker_path() -> PathBuf {
     state_dir().join(format!("{}.capturing", session_key()))
 }
 
-pub fn mark_capture() {
-    let _ = secure_open(&marker_path()).map(|mut f| f.write_all(b"1"));
+pub fn mark_capture() -> Result<()> {
+    secure_open(&marker_path())?.write_all(b"1")?;
+    Ok(())
 }
 
 /// Whether a capture happened during this command, clearing the marker.
 pub fn take_capture_marker() -> bool {
     fs::remove_file(marker_path()).is_ok()
+}
+
+/// Why the state directory is unusable, if it is.
+///
+/// `load` failing closed to an empty history also switches off the guard that
+/// depends on it, so the caller needs to be able to say so rather than behave as
+/// though this were a fresh session.
+pub fn unusable_reason() -> Option<String> {
+    ensure_state_dir().err().map(|e| format!("{e:#}"))
 }
 
 /// Directory holding one log per terminal session.
@@ -275,22 +285,18 @@ pub fn is_tcap_invocation(cmd: &str) -> bool {
     })
 }
 
-/// Whether this record is a tcap capture, by any spelling.
-///
-/// `was_capture` is authoritative: the hook set it during the command that
-/// captured, so it holds for aliases and shell functions that no amount of text
-/// matching would catch.
-pub fn is_capture_record(r: &Record) -> bool {
-    r.was_capture || is_tcap_invocation(&r.command)
-}
-
 /// The `n`th real command counting back from the most recent (`n == 1` is the
 /// last command), with `tcap` invocations skipped.
 pub fn nth_from_end(records: &[Record], n: usize) -> Option<&Record> {
+    // Deliberately the text check, not `is_capture_record`. `was_capture` means
+    // "tcap wrote to this terminal during this command", which is also true of a
+    // wrapper script, a Makefile target or a git alias that happens to call
+    // tcap. Skipping those would silently return the command before them — on
+    // tmux too, where boundaries are exact and none of this is needed.
     records
         .iter()
         .rev()
-        .filter(|r| !is_capture_record(r))
+        .filter(|r| !is_tcap_invocation(&r.command))
         .nth(n.saturating_sub(1))
 }
 
@@ -336,23 +342,29 @@ mod tests {
         }
     }
 
-    /// The marker catches what text matching cannot: an alias or function whose
-    /// name says nothing about tcap.
+    /// The two signals answer different questions and are used in different
+    /// places: `was_capture` gates the refusal (is tcap's text on screen), the
+    /// text check gates indexing (was this a tcap run). An alias is visible only
+    /// to the first; a piped capture sets only the second. Conflating them has
+    /// broken each direction once.
     #[test]
-    fn was_capture_beats_the_text_heuristic() {
+    fn the_two_capture_signals_are_independent() {
         let mut aliased = rec("t");
-        assert!(
-            !is_capture_record(&aliased),
-            "text alone cannot see an alias"
-        );
         aliased.was_capture = true;
         assert!(
-            is_capture_record(&aliased),
-            "the hook's marker is authoritative"
+            !is_tcap_invocation(&aliased.command),
+            "text cannot see an alias"
         );
 
-        assert!(is_capture_record(&rec("tcap --json")));
-        assert!(!is_capture_record(&rec("npm run build")));
+        let piped = rec("tcap --output | llm");
+        assert!(
+            is_tcap_invocation(&piped.command),
+            "text sees an explicit run"
+        );
+        assert!(
+            !piped.was_capture,
+            "but stdout was a pipe, so nothing was displayed"
+        );
     }
 
     #[test]
@@ -373,16 +385,18 @@ mod tests {
         assert!(nth_from_end(&records, 3).is_none());
     }
 
-    /// An aliased capture has no tcap in its text, so only `was_capture` keeps
-    /// it from being indexed as a real command — which would pair its metadata
-    /// with unrelated output, on tmux as much as kitty.
+    /// A command that merely *called* tcap is still a real command, and must
+    /// stay indexable. `was_capture` cannot tell "was tcap" from "called tcap",
+    /// so indexing uses the text check and accepts missing the alias case —
+    /// naming an alias is visibly odd, whereas silently skipping someone's
+    /// deploy script returns the wrong command with nothing to notice.
     #[test]
-    fn nth_skips_captures_made_through_an_alias() {
-        let mut aliased = rec("t");
-        aliased.was_capture = true;
-        let records = vec![rec("npm run build"), rec("ls"), aliased];
+    fn nth_keeps_commands_that_merely_called_tcap() {
+        let mut wrapper = rec("./deploy.sh");
+        wrapper.was_capture = true;
+        let records = vec![rec("npm run build"), wrapper];
 
-        assert_eq!(nth_from_end(&records, 1).unwrap().command, "ls");
+        assert_eq!(nth_from_end(&records, 1).unwrap().command, "./deploy.sh");
         assert_eq!(nth_from_end(&records, 2).unwrap().command, "npm run build");
     }
 

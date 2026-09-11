@@ -146,7 +146,11 @@ fn render_one(cap: &Capture, mode: Mode) -> String {
         Mode::Command => cap.command.clone().unwrap_or_default(),
         Mode::Raw | Mode::Output => cap.output.clone(),
         Mode::Annotated => {
-            if !cap.has_metadata() {
+            // `approximate` counts as something worth saying, even with no
+            // command or exit code to show: kitty without shell integration has
+            // no metadata at all, and that is precisely where an unlabelled body
+            // is most likely to be the wrong one.
+            if !cap.has_metadata() && !cap.approximate {
                 return cap.output.clone();
             }
             let h = header(cap);
@@ -286,6 +290,18 @@ mod tests {
             out,
             "$ npm run build\n# exit: 1  cwd: /tmp/app  took: 3.2s\n\nError: Cannot find module 'foo'"
         );
+    }
+
+    /// Without shell integration there is no metadata, but an approximate body
+    /// still has to say so.
+    #[test]
+    fn approximate_is_labelled_even_with_no_metadata() {
+        let mut c = cap_with_output("mystery output");
+        c.source = "kitty".into();
+        c.approximate = true;
+        let out = render(&[c], Mode::Annotated);
+        assert!(out.contains("# note:"), "{out}");
+        assert!(out.contains("mystery output"), "{out}");
     }
 
     #[test]

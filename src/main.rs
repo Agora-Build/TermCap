@@ -37,13 +37,26 @@ fn main() {
 /// `--help` exits before any of it runs.
 fn mark_if_stdout_is_terminal() {
     if std::io::stdout().is_terminal() {
-        state::mark_capture();
+        warn_if_unmarked(state::mark_capture());
     }
 }
 
 fn mark_if_stderr_is_terminal() {
     if std::io::stderr().is_terminal() {
-        state::mark_capture();
+        warn_if_unmarked(state::mark_capture());
+    }
+}
+
+/// A marker that could not be written leaves the next capture unguarded, so the
+/// failure is reported rather than swallowed. It is not fatal: refusing to
+/// capture at all because a temp file is unwritable would be a worse trade than
+/// capturing with the guard announced as off.
+fn warn_if_unmarked(r: Result<()>) {
+    if let Err(e) = r {
+        eprintln!(
+            "tcap: could not record that this output is on screen ({e:#}).\n\
+             \x20 The check that stops the next capture returning this text is off."
+        );
     }
 }
 
@@ -134,6 +147,17 @@ fn record(args: &RecordArgs) -> Result<()> {
 
 fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     let backend = backend::detect(settings.backend.as_deref())?;
+
+    if !settings.quiet {
+        if let Some(why) = state::unusable_reason() {
+            eprintln!(
+                "tcap: cannot use the state directory ({why}).\n\
+                 \x20 Continuing without command history: no exit codes, and the check\n\
+                 \x20 that stops a capture returning tcap's own output is off."
+            );
+        }
+    }
+
     let records = state::load();
     let mode = settings.mode;
     let raw = mode == cli::Mode::Raw;
