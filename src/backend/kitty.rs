@@ -95,7 +95,11 @@ impl Kitty {
     fn remote_control_hint(err: &anyhow::Error, listen_on: &Option<String>) -> String {
         let msg = err.to_string().to_lowercase();
 
-        if msg.contains("socket only") || msg.contains("socket-only") {
+        // Matched on the bare word rather than a phrase: kitty 0.48.2 says
+        // "Remote control is allowed over a socket only" (captured live), but
+        // word order is not something to depend on across versions, and by this
+        // point we already know it is a remote-control failure.
+        if msg.contains("socket") {
             return match listen_on {
                 None => "kitty is set to `allow_remote_control socket-only`, but \
                      $KITTY_LISTEN_ON is unset, so there is no socket to use.\n\
@@ -119,10 +123,13 @@ impl Kitty {
             return "kitty is requiring a remote-control password, which tcap cannot send, \
                  so this setup is unsupported.\n\
                  Rather than weaken authentication for `get-text` — which returns whatever \
-                 is on screen, credentials included — either run inside tmux, which needs \
-                 no kitty remote control at all, or expose kitty on a Unix socket only your \
-                 user can reach:\n  allow_remote_control socket-only\n  \
-                 listen_on unix:/tmp/kitty-{kitty_pid}"
+                 is on screen, credentials included — run inside tmux, which needs no kitty \
+                 remote control at all. If you would rather use a socket, put it somewhere \
+                 only you can open, such as a directory of your own with mode 0700:\n  \
+                 allow_remote_control socket-only\n  \
+                 listen_on unix:${XDG_RUNTIME_DIR}/kitty-{kitty_pid}\n\
+                 A socket in /tmp is reachable by anyone with write permission on it, which \
+                 under a group-writable umask is more than just you."
                 .to_string();
         }
 
@@ -241,8 +248,12 @@ impl Backend for Kitty {
 
         let mut args = self.rc_args(&listen_on);
         args.push("ls");
-        let reachable = run(&self.exe, &args).is_ok();
-        d.push(match run(&self.exe, &args) {
+        // Probed once: running it twice costs a second round trip and lets the
+        // two results disagree, so the get-text probe could be skipped while
+        // remote control was reported healthy, or vice versa.
+        let ls = run(&self.exe, &args);
+        let reachable = ls.is_ok();
+        d.push(match ls {
             Ok(_) => Diagnostic::ok("remote control", format!("reachable via {channel}")),
             // The underlying error is kept: the hint is a guess from keywords,
             // and for anything it does not recognise the real message is the
@@ -261,22 +272,23 @@ impl Backend for Kitty {
                 d.push(Diagnostic::ok("window", w.clone()));
 
                 // Probe exactly what fetch runs, so doctor cannot report a path
-                // healthy that fetch would fail on. Skipped when remote control
-                // is already down, otherwise the same failure gets reported a
-                // second time under an unrelated label.
-                if !reachable {
-                    return d;
+                // healthy that fetch would fail on. Only the probe is skipped
+                // when remote control is already down — an early return here
+                // would also drop the diagnostics below it.
+                if reachable {
+                    let probe = self.get_text_args(&listen_on, &w, false);
+                    d.push(match run(&self.exe, &probe) {
+                        Ok(t) if t.trim().is_empty() => Diagnostic::bad(
+                            "shell integration",
+                            "the extent resolved but returned nothing — kitty's own shell \
+                             integration is probably off (`shell_integration enabled`)",
+                        ),
+                        Ok(_) => {
+                            Diagnostic::ok("shell integration", "last_non_empty_output resolves")
+                        }
+                        Err(e) => Diagnostic::bad("shell integration", e.to_string()),
+                    });
                 }
-                let probe = self.get_text_args(&listen_on, &w, false);
-                d.push(match run(&self.exe, &probe) {
-                    Ok(t) if t.trim().is_empty() => Diagnostic::bad(
-                        "shell integration",
-                        "the extent resolved but returned nothing — kitty's own shell \
-                         integration is probably off (`shell_integration enabled`)",
-                    ),
-                    Ok(_) => Diagnostic::ok("shell integration", "last_non_empty_output resolves"),
-                    Err(e) => Diagnostic::bad("shell integration", e.to_string()),
-                });
             }
             None => d.push(Diagnostic::bad(
                 "window",
@@ -361,8 +373,14 @@ mod tests {
             ("1 or 2", None),
         ];
         for (raw, want) in cases {
-            let got = raw.trim().parse::<u64>().ok().map(|id| format!("id:{id}"));
-            assert_eq!(got.as_deref(), want, "input {raw:?}");
+            // Must call the production parser: reimplementing it here would
+            // assert only that this line does what this line does, while being
+            // the sole test guarding the cross-window guarantee.
+            assert_eq!(
+                Kitty::parse_window_id(raw).as_deref(),
+                want,
+                "input {raw:?}"
+            );
         }
     }
 
