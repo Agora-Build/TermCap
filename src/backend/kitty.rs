@@ -86,47 +86,45 @@ impl Kitty {
             .filter(|s| !s.is_empty())
     }
 
+    /// The socket recommendation, given once so the three places that offer it
+    /// cannot drift apart.
+    ///
+    /// Two things this text has to get right, because it exists to be pasted
+    /// into kitty.conf:
+    ///
+    /// - **No trailing comments.** kitty takes the rest of the line as the
+    ///   value; `#` only opens a comment at the start of a line. Verified: a
+    ///   `listen_on unix:/tmp/sock   # note` produced a socket literally named
+    ///   `/tmp/sock   # note-69755`.
+    /// - **One `listen_on` line.** Last one wins, so offering both platforms'
+    ///   lines would hand a macOS user the Linux one — where
+    ///   `$XDG_RUNTIME_DIR` is a systemd convention that is normally unset and
+    ///   expands to nothing, putting the socket at the filesystem root.
+    fn socket_advice() -> String {
+        // macOS $TMPDIR is already per-user and 0700; $XDG_RUNTIME_DIR is the
+        // equivalent on Linux.
+        let dir = if cfg!(target_os = "macos") {
+            "${TMPDIR}"
+        } else {
+            "${XDG_RUNTIME_DIR}"
+        };
+        format!(
+            "  allow_remote_control socket-only\n  \
+             listen_on unix:{dir}/kitty-{{kitty_pid}}\n\
+             Keep the socket somewhere only you can open — the path above already is. \
+             One in /tmp is reachable by anyone with write permission on it, which under \
+             a group-writable umask is more than just you. Note kitty.conf has no trailing \
+             comments: everything after the value is part of it."
+        )
+    }
+
     /// Turn kitty's refusal into the fix for the mode actually in force.
     ///
-    /// `allow_remote_control` has several values and they need different
-    /// answers: telling a `socket-only` user to set `yes` is wrong advice, and
-    /// its real cause — no socket to talk to — is not obvious from kitty's
-    /// message alone.
-    /// The socket recommendation, given once so the three places that offer it
-    /// cannot drift apart — and correct per platform: `$XDG_RUNTIME_DIR` is a
-    /// systemd convention, normally unset on macOS, where it would expand to
-    /// nothing and leave the socket at the filesystem root.
-    const SOCKET_ADVICE: &'static str = "  allow_remote_control socket-only\n  \
-         listen_on unix:${TMPDIR}/kitty-{kitty_pid}      # macOS: $TMPDIR is per-user, 0700\n  \
-         listen_on unix:${XDG_RUNTIME_DIR}/kitty-{kitty_pid}   # Linux\n\
-         Put it somewhere only you can open. A socket in /tmp is reachable by anyone with \
-         write permission on it, which under a group-writable umask is more than just you.";
-
+    /// `allow_remote_control` has several values needing different answers:
+    /// telling a `socket-only` user to set `yes` is wrong advice, and the real
+    /// cause — no socket to talk to — is not obvious from kitty's message.
     fn remote_control_hint(err: &anyhow::Error, listen_on: &Option<String>) -> String {
         let msg = err.to_string().to_lowercase();
-
-        // Matched on the bare word rather than a phrase: kitty 0.48.2 says
-        // "Remote control is allowed over a socket only" (captured live), but
-        // word order is not something to depend on across versions, and by this
-        // point we already know it is a remote-control failure.
-        if msg.contains("socket") {
-            return match listen_on {
-                // "socket" is one word out of kitty's message, so this is an
-                // inference, not a reading of the config — hedged accordingly.
-                None => format!(
-                    "This looks like `allow_remote_control socket-only` with \
-                     $KITTY_LISTEN_ON unset, leaving no socket to use.\n\
-                     Add to ~/.config/kitty/kitty.conf and restart kitty:\n{}\n\
-                     If it is set in your shell but not here, something in between is \
-                     clearing the environment.",
-                    Self::SOCKET_ADVICE
-                ),
-                Some(sock) => format!(
-                    "the socket at {sock} was refused. Restart kitty so the running \
-                     instance and $KITTY_LISTEN_ON agree."
-                ),
-            };
-        }
 
         if msg.contains("password") {
             // Deliberately not `remote_control_password "" get-text`: that would
@@ -139,8 +137,43 @@ impl Kitty {
                  Rather than weaken authentication for `get-text` — which returns whatever \
                  is on screen, credentials included — run inside tmux, which needs no kitty \
                  remote control at all. If you would rather use a socket:\n{}",
-                Self::SOCKET_ADVICE
+                Self::socket_advice()
             );
+        }
+
+        // Checked after `password`, so a password refusal that happens to name
+        // the socket it arrived on is not answered with "restart kitty".
+        //
+        // Matched on the bare word rather than a phrase: kitty 0.48.2 says
+        // "Remote control is allowed over a socket only" (captured live), but
+        // word order is not worth depending on across versions, and by here we
+        // already know it is a remote-control failure.
+        if msg.contains("socket") {
+            return match listen_on {
+                // "socket" is one word out of kitty's message, so this is an
+                // inference, not a reading of the config — hedged accordingly.
+                None => format!(
+                    "This looks like `allow_remote_control socket-only` with \
+                     $KITTY_LISTEN_ON unset, leaving no socket to use.\n\
+                     Add to ~/.config/kitty/kitty.conf and restart kitty:\n{}\n\
+                     If it is set in your shell but not here, something in between is \
+                     clearing the environment.",
+                    Self::socket_advice()
+                ),
+                Some(sock) => format!(
+                    "the socket at {sock} was refused. Restart kitty so the running \
+                     instance and $KITTY_LISTEN_ON agree."
+                ),
+            };
+        }
+
+        if msg.contains("no matching") || msg.contains("no window") {
+            return "kitty could not find the window tcap asked for.\n\
+                 $KITTY_LISTEN_ON probably points at a different kitty instance — a \
+                 `listen_on` without {kitty_pid} is shared between instances, so window ids \
+                 from one do not exist in another. Give each instance its own socket:\n"
+                .to_string()
+                + &Self::socket_advice();
         }
 
         format!(
@@ -148,7 +181,7 @@ impl Kitty {
              ~/.config/kitty/kitty.conf either:\n  allow_remote_control yes\nor keep it \
              restricted and give tcap a socket:\n{}\nThen restart kitty. If the message \
              above says something else, that is the real cause.",
-            Self::SOCKET_ADVICE
+            Self::socket_advice()
         )
     }
 
