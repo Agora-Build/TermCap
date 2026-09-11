@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Records retained when the log is compacted. Must comfortably exceed the
@@ -86,15 +86,28 @@ fn current_uid() -> u32 {
 /// already per-user) but the check is cheap and the fallback is not.
 fn ensure_state_dir() -> Result<PathBuf> {
     let dir = state_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("securing {}", dir.display()))?;
 
-    // symlink_metadata, so a symlink in place of the directory is caught rather
-    // than followed.
-    let md = fs::symlink_metadata(&dir)?;
+    // Created 0700 from the outset rather than chmod'ed afterwards, so there is
+    // no window where it exists world-readable.
+    match fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+
+    // Inspected before anything is mutated: `set_permissions` follows symlinks,
+    // so tightening first would let a planted symlink redirect the chmod onto a
+    // file of the attacker's choosing that the victim owns.
+    let md = fs::symlink_metadata(&dir).with_context(|| format!("checking {}", dir.display()))?;
     if !md.is_dir() {
-        return Err(anyhow!("{} is not a directory", dir.display()));
+        return Err(anyhow!(
+            "{} is a symlink or not a directory — refusing to use it",
+            dir.display()
+        ));
     }
     if md.uid() != current_uid() {
         return Err(anyhow!(
@@ -103,7 +116,30 @@ fn ensure_state_dir() -> Result<PathBuf> {
             md.uid()
         ));
     }
+    // Only now that it is known to be our own real directory.
+    if md.mode() & 0o077 != 0 {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", dir.display()))?;
+    }
+
     Ok(dir)
+}
+
+/// Read a state file with the same checks the writes get.
+///
+/// Reads matter as much as writes here: a pre-created directory with a crafted
+/// log would let another user inject records, and their command text is printed
+/// back — escape sequences included.
+fn secure_read(path: &Path) -> Option<String> {
+    ensure_state_dir().ok()?;
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Open a state file for writing without following symlinks.
@@ -172,7 +208,7 @@ pub fn append(rec: &Record) -> Result<()> {
 }
 
 fn compact_if_needed(path: &PathBuf) -> Result<()> {
-    let Ok(text) = fs::read_to_string(path) else {
+    let Some(text) = secure_read(path) else {
         return Ok(());
     };
     let lines: Vec<&str> = text.lines().collect();
@@ -190,7 +226,7 @@ fn compact_if_needed(path: &PathBuf) -> Result<()> {
 /// Load this session's records, oldest first. Unparseable lines are skipped
 /// rather than failing the whole read.
 pub fn load() -> Vec<Record> {
-    let Ok(text) = fs::read_to_string(log_path()) else {
+    let Some(text) = secure_read(&log_path()) else {
         return Vec::new();
     };
     text.lines()

@@ -20,46 +20,61 @@ use cli::{Cli, RecordArgs, ShellKind, Sub};
 use state::Record;
 
 fn main() {
-    let failed = match run() {
-        Ok(()) => false,
-        Err(e) => {
-            eprintln!("tcap: {e:#}");
-            true
-        }
-    };
-
-    // Whatever tcap just wrote to the terminal — a capture, a warning, or an
-    // error — is now the screen's last non-empty output, which is what a
-    // boundary-less backend would hand back next time. Marking only the
-    // successful stdout path left the warnings and errors unaccounted for, and
-    // `tcap --output | svc` still prints its warning to the tty.
-    //
-    // The record hook is excluded: it prints nothing.
-    if !matches!(std::env::args().nth(1).as_deref(), Some("__record")) && wrote_to_terminal() {
-        state::mark_capture();
-    }
-
-    if failed {
+    if let Err(e) = run() {
+        eprintln!("tcap: {e:#}");
+        mark_if_stderr_is_terminal();
         std::process::exit(1);
     }
 }
 
-fn wrote_to_terminal() -> bool {
-    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
+/// Record that tcap put text on the screen.
+///
+/// Called at the point of each write, gated on *that stream* being a terminal —
+/// not inferred from isatty at exit. Inferring was wrong three ways: under
+/// `eval "$(tcap init zsh)"` stdout is a pipe but stderr is still a tty, so
+/// every shell startup marked itself and poisoned its first real command;
+/// `tcap --output > f` marked despite printing nothing visible; and clap's
+/// `--help` exits before any of it runs.
+fn mark_if_stdout_is_terminal() {
+    if std::io::stdout().is_terminal() {
+        state::mark_capture();
+    }
+}
+
+fn mark_if_stderr_is_terminal() {
+    if std::io::stderr().is_terminal() {
+        state::mark_capture();
+    }
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // --help and --version print to stdout, usage errors to stderr.
+            let _ = e.print();
+            if e.use_stderr() {
+                mark_if_stderr_is_terminal();
+            } else {
+                mark_if_stdout_is_terminal();
+            }
+            std::process::exit(e.exit_code());
+        }
+    };
 
     match &cli.command {
         // doctor must survive a broken config — reporting the breakage is
         // exactly its job, so the error is handed over rather than propagated.
+        // doctor and init put their text on screen too when not redirected —
+        // `eval "$(tcap init zsh)"` pipes stdout, so that correctly does not mark.
         Some(Sub::Doctor) => {
             print!("{}", doctor::run(config::load()));
+            mark_if_stdout_is_terminal();
             Ok(())
         }
         Some(Sub::Init { shell }) => {
             print!("{}", init_script(*shell));
+            mark_if_stdout_is_terminal();
             Ok(())
         }
         // The record hook runs before every prompt and must not depend on, or
@@ -182,9 +197,11 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     let text = render::render(&caps, mode);
 
     println!("{text}");
+    mark_if_stdout_is_terminal();
 
-    if !settings.quiet {
-        emit_hints(&caps, backend.as_ref(), mode);
+    if !settings.quiet && emit_hints(&caps, backend.as_ref(), mode) {
+        // The hint itself is now the screen's last output.
+        mark_if_stderr_is_terminal();
     }
 
     if settings.copy {
@@ -196,7 +213,9 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
 
 /// Warn about degraded captures, naming the cause and the fix. Goes to stderr
 /// so `tcap | sgpt` still pipes clean text.
-fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) {
+/// Returns whether anything was printed.
+fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) -> bool {
+    let mut printed = false;
     // Every mode but Command: --output and --raw are the ones piped into another
     // tool, so they are where handing over an earlier command's text does the
     // most damage. Command mode renders the shell's own record, which is exact,
@@ -211,15 +230,16 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode)
              \x20 exact boundaries; --quiet silences this.",
             backend.name()
         );
+        printed = true;
     }
 
     // Only the annotated view promises metadata, so only it can disappoint.
     if mode != cli::Mode::Annotated {
-        return;
+        return printed;
     }
 
     if caps.iter().any(Capture::has_metadata) {
-        return;
+        return printed;
     }
 
     let shell = detect_shell();
@@ -247,6 +267,8 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode)
             backend.name()
         );
     }
+
+    true
 }
 
 fn detect_shell() -> String {
