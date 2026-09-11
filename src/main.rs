@@ -90,6 +90,7 @@ fn record(args: &RecordArgs) -> Result<()> {
         duration_ms,
         start_line,
         end_line,
+        was_capture: state::take_capture_marker(),
     })
 }
 
@@ -129,11 +130,11 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         ));
     }
 
-    // Unfiltered: nth_from_end skips tcap invocations, but here we need to know
-    // whether tcap itself ran most recently.
+    // Unfiltered: nth_from_end skips captures, but here we need to know whether
+    // the most recent command *was* one.
     let after_tcap = records
         .last()
-        .map(|r| state::is_tcap_invocation(&r.command))
+        .map(state::is_capture_record)
         .unwrap_or(false);
 
     // Refuse rather than emit, in the one case where the output is known to be
@@ -156,6 +157,10 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     let text = render::render(&caps, mode);
 
     println!("{text}");
+
+    // Marked after emitting: the next command's hook collects this, so a
+    // following capture knows the screen's last output is ours.
+    state::mark_capture();
 
     if !settings.quiet {
         emit_hints(&caps, backend.as_ref(), mode);

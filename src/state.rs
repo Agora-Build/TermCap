@@ -34,6 +34,32 @@ pub struct Record {
     pub start_line: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<i64>,
+    /// Set when tcap performed a capture during this command.
+    ///
+    /// Recorded by the hook rather than inferred from the command text, so it
+    /// holds for `command tcap`, `env tcap`, an alias, a shell function or any
+    /// other spelling that text matching cannot see.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub was_capture: bool,
+}
+
+/// Dropped by a capture, collected by the next `__record`.
+///
+/// tcap captures *during* a command; the hook records that same command when it
+/// finishes. So a marker present at record time means this command is the one
+/// that captured, whatever it was called.
+fn marker_path() -> PathBuf {
+    state_dir().join(format!("{}.capturing", session_key()))
+}
+
+pub fn mark_capture() {
+    let _ = fs::create_dir_all(state_dir());
+    let _ = fs::write(marker_path(), b"1");
+}
+
+/// Whether a capture happened during this command, clearing the marker.
+pub fn take_capture_marker() -> bool {
+    fs::remove_file(marker_path()).is_ok()
 }
 
 /// Directory holding one log per terminal session.
@@ -134,24 +160,41 @@ pub fn load() -> Vec<Record> {
 }
 
 /// `-c` counts real commands, so `tcap -c 1` must mean "the command I just ran",
-/// never a previous capture. Checks the first word of every pipeline or list
-/// segment, skipping leading `VAR=value` assignments.
+/// never a previous capture.
+///
+/// Text matching only, so it cannot see an alias or a shell function — which is
+/// why the authoritative signal is [`Record::was_capture`], set by the hook.
+/// This remains for records written before that existed, and for skipping in
+/// [`nth_from_end`]. It looks past leading `VAR=value` assignments and the usual
+/// wrappers.
 pub fn is_tcap_invocation(cmd: &str) -> bool {
     cmd.split(['|', ';', '&']).any(|seg| {
         let mut words = seg.split_whitespace().peekable();
-        while let Some(w) = words.peek() {
-            // A leading assignment like `FOO=bar tcap` is still a tcap run.
-            if w.contains('=') && !w.starts_with('=') {
+        loop {
+            let Some(w) = words.peek() else { return false };
+            let base = w.rsplit('/').next().unwrap_or(w);
+            // `FOO=bar tcap`, `command tcap`, `env FOO=1 tcap`, `\tcap`.
+            if (w.contains('=') && !w.starts_with('='))
+                || matches!(
+                    base,
+                    "command" | "builtin" | "exec" | "env" | "nohup" | "time"
+                )
+            {
                 words.next();
-            } else {
-                break;
+                continue;
             }
+            return base.trim_start_matches('\\') == "tcap";
         }
-        words
-            .next()
-            .map(|first| first.rsplit('/').next().unwrap_or(first) == "tcap")
-            .unwrap_or(false)
     })
+}
+
+/// Whether this record is a tcap capture, by any spelling.
+///
+/// `was_capture` is authoritative: the hook set it during the command that
+/// captured, so it holds for aliases and shell functions that no amount of text
+/// matching would catch.
+pub fn is_capture_record(r: &Record) -> bool {
+    r.was_capture || is_tcap_invocation(&r.command)
 }
 
 /// The `n`th real command counting back from the most recent (`n == 1` is the
@@ -176,6 +219,7 @@ mod tests {
             duration_ms: None,
             start_line: None,
             end_line: None,
+            was_capture: false,
         }
     }
 
@@ -187,6 +231,41 @@ mod tests {
         assert!(is_tcap_invocation("/usr/local/bin/tcap --json"));
         assert!(is_tcap_invocation("FOO=bar tcap"));
         assert!(is_tcap_invocation("ls; tcap"));
+    }
+
+    /// Wrappers that the original first-word check walked straight past.
+    #[test]
+    fn detects_wrapped_invocations() {
+        for cmd in [
+            "command tcap",
+            "env tcap --output",
+            "env FOO=1 tcap",
+            "builtin tcap",
+            "exec tcap",
+            "nohup tcap",
+            "command /usr/local/bin/tcap",
+        ] {
+            assert!(is_tcap_invocation(cmd), "should detect: {cmd}");
+        }
+    }
+
+    /// The marker catches what text matching cannot: an alias or function whose
+    /// name says nothing about tcap.
+    #[test]
+    fn was_capture_beats_the_text_heuristic() {
+        let mut aliased = rec("t");
+        assert!(
+            !is_capture_record(&aliased),
+            "text alone cannot see an alias"
+        );
+        aliased.was_capture = true;
+        assert!(
+            is_capture_record(&aliased),
+            "the hook's marker is authoritative"
+        );
+
+        assert!(is_capture_record(&rec("tcap --json")));
+        assert!(!is_capture_record(&rec("npm run build")));
     }
 
     #[test]
