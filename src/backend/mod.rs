@@ -1,9 +1,10 @@
 //! Terminal adapters.
 //!
 //! Each backend answers one question: "give me the text of command block N".
-//! They differ enormously in what they can do — kitty knows its own command
-//! boundaries and needs no help, while tmux knows nothing and relies entirely
-//! on the coordinates our shell hook recorded.
+//! They differ enormously in what they can do — tmux needs boundaries supplied
+//! by the shell hook but then knows them exactly, while kitty needs no help yet
+//! can only return its last non-empty output, which may be an earlier command's.
+//! `has_command_boundaries` is that distinction.
 
 use anyhow::{anyhow, Context, Result};
 
@@ -68,6 +69,15 @@ pub trait Backend {
     /// only use it for metadata.
     fn fetch(&self, index: usize, rec: Option<&Record>, raw: bool) -> Result<Fetched>;
 
+    /// Whether the backend can tie output to a specific command.
+    ///
+    /// kitty cannot: it returns the last *non-empty* output, which may belong to
+    /// an earlier command. Callers use this to qualify what they are showing
+    /// rather than presenting shell-record metadata as if it described the text.
+    fn has_command_boundaries(&self) -> bool {
+        true
+    }
+
     /// Whether this backend can reach past the most recent command.
     ///
     /// Only tmux can. kitty and iTerm2 expose their latest command block and
@@ -82,8 +92,8 @@ pub trait Backend {
 
 /// Order matters: **tmux wins whenever it is present.** Inside kitty running
 /// tmux, `kitty @ get-text` returns tmux's rendered viewport rather than the
-/// shell's scrollback, and tmux swallows the prompt marks `last_cmd_output`
-/// relies on — so asking kitty there silently returns the wrong text.
+/// shell's scrollback, and tmux swallows the prompt marks kitty's output extents
+/// rely on — so asking kitty there silently returns the wrong text.
 pub fn detect(forced: Option<&str>) -> Result<Box<dyn Backend>> {
     if let Some(name) = forced {
         return match name {

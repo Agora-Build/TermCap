@@ -83,6 +83,8 @@ tcap --output         # output only, no header
 tcap --command        # the command text only
 tcap --raw            # verbatim, ANSI colour intact, no header
 tcap --json           # {command, exit_code, cwd, duration_ms, output, source}
+                      # plus "approximate": true when the backend cannot vouch
+                      # that the output belongs to that command
 tcap --copy           # also copy to the clipboard
 ```
 
@@ -140,7 +142,7 @@ Norway problem, where `quiet: no` silently parses as `false`.
 | Terminal | Last command | Older commands (`-c 2`) | Notes |
 |---|---|---|---|
 | **tmux** | yes | **yes** | The only backend that can reach back |
-| **kitty** | yes | no | Needs `allow_remote_control yes` |
+| **kitty** | yes | no | Needs remote control (`yes`, or `socket-only` + `listen_on`) |
 | **iTerm2** | yes | no | Needs Shell Integration + `pip install iterm2` |
 | **WezTerm** | not yet | no | Detected; run inside tmux |
 | Ghostty, Terminal.app, Alacritty | no | no | No remote-control API — run inside tmux |
@@ -149,13 +151,26 @@ Two things worth knowing:
 
 **tmux wins whenever it is running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's *rendered viewport*, not the shell's real history —
-and tmux swallows the prompt marks kitty's `last_cmd_output` depends on. So tmux
+and tmux swallows the prompt marks kitty's output extents depend on. So tmux
 is always treated as authoritative when it is in the stack.
 
-**Only tmux can reach past the most recent command.** kitty exposes a
-`last_cmd_output` extent and nothing for older commands; iTerm2 exposes only its
-latest prompt. `tcap -c 2` therefore fails with a pointer to tmux rather than
-silently returning the wrong block.
+**Only tmux can reach past the most recent command.** kitty exposes only the
+latest output and nothing older; iTerm2 exposes only its latest prompt. `tcap -c
+2` therefore fails with a pointer to tmux rather than silently returning the
+wrong block.
+
+**On kitty, output is the last *non-empty* output.** kitty counts the running
+`tcap` as the current command, so it has to be asked for the last output that
+wasn't empty. The consequence: if your last command printed nothing, kitty
+returns an *older* command's output while the header names the last one. The
+annotated header carries a `# note:` line saying so, and `--json` sets
+`"approximate": true`. Two `tcap` runs in a row are a **hard error** rather than
+a label, since there the mismatch is certain. tmux has no such
+ambiguity, because the shell hook records real boundaries. kitty also
+needs remote control reachable — either `allow_remote_control yes`, or
+`socket-only` with a `listen_on` socket in a directory only you can open
+(`${TMPDIR}` on macOS, `${XDG_RUNTIME_DIR}` on Linux). A socket in `/tmp` is
+reachable by anyone with write permission on it.
 
 When something is missing, `tcap` says what and why:
 
@@ -177,9 +192,10 @@ and the next begins. `tcap` fills those gaps from two sides:
 
 - **Shell hooks** (`tcap init`) record the command text, exit code, cwd and
   duration on every prompt.
-- **Terminal adapters** retrieve the actual text. kitty and iTerm2 know their own
-  command boundaries; tmux does not (it has no OSC 133 support), so the hook also
-  records where output starts and ends.
+- **Terminal adapters** retrieve the actual text. tmux has no OSC 133 support, so
+  the hook also records where output starts and ends — which is why it is the
+  only backend with exact boundaries. iTerm2 tracks its own prompts; kitty can
+  only return its last non-empty output.
 
 Those tmux coordinates are stored as `history_size + cursor_y`, which is stable
 under scrolling: as lines scroll off, `history_size` grows by exactly as much as
@@ -189,7 +205,7 @@ under scrolling: as lines scroll off, `history_size` grows by exactly as much as
 ## Development
 
 ```sh
-cargo test                       # 49 unit + 11 end-to-end tests
+cargo test                       # 61 unit + 11 end-to-end tests
 git config core.hooksPath .githooks   # run fmt, clippy and tests before every push
 ```
 

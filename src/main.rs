@@ -9,6 +9,7 @@ mod doctor;
 mod render;
 mod state;
 
+use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -20,23 +21,69 @@ use state::Record;
 
 fn main() {
     if let Err(e) = run() {
+        // Deliberately unmarked: an error message is not captured text, and
+        // marking it would make a failed `tcap -c 2` poison the next capture.
         eprintln!("tcap: {e:#}");
         std::process::exit(1);
     }
 }
 
+/// Record that tcap put text on the screen.
+///
+/// Called at the point of each write, gated on *that stream* being a terminal —
+/// not inferred from isatty at exit. Inferring was wrong three ways: under
+/// `eval "$(tcap init zsh)"` stdout is a pipe but stderr is still a tty, so
+/// every shell startup marked itself and poisoned its first real command;
+/// `tcap --output > f` marked despite printing nothing visible; and clap's
+/// `--help` exits before any of it runs.
+fn mark_if_stdout_is_terminal() {
+    if std::io::stdout().is_terminal() {
+        warn_if_unmarked(state::mark_capture());
+    }
+}
+
+/// A marker that could not be written leaves the next capture unguarded, so the
+/// failure is reported rather than swallowed. It is not fatal: refusing to
+/// capture at all because a temp file is unwritable would be a worse trade than
+/// capturing with the guard announced as off.
+fn warn_if_unmarked(r: Result<()>) {
+    if let Err(e) = r {
+        eprintln!(
+            "tcap: could not record that this output is on screen ({e:#}).\n\
+             \x20 The check that stops the next capture returning this text is off."
+        );
+    }
+}
+
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // --help and --version print to stdout, usage errors to stderr.
+            let _ = e.print();
+            // --help and --version put a screenful on stdout, which does become
+            // the last output. Usage errors go to stderr and are not marked, for
+            // the same reason other diagnostics are not.
+            if !e.use_stderr() {
+                mark_if_stdout_is_terminal();
+            }
+            std::process::exit(e.exit_code());
+        }
+    };
 
     match &cli.command {
         // doctor must survive a broken config — reporting the breakage is
         // exactly its job, so the error is handed over rather than propagated.
+        // doctor and init put their text on screen too when not redirected —
+        // `eval "$(tcap init zsh)"` pipes stdout, so that correctly does not mark.
         Some(Sub::Doctor) => {
             print!("{}", doctor::run(config::load()));
+            mark_if_stdout_is_terminal();
             Ok(())
         }
         Some(Sub::Init { shell }) => {
             print!("{}", init_script(*shell));
+            mark_if_stdout_is_terminal();
             Ok(())
         }
         // The record hook runs before every prompt and must not depend on, or
@@ -90,11 +137,23 @@ fn record(args: &RecordArgs) -> Result<()> {
         duration_ms,
         start_line,
         end_line,
+        was_capture: state::take_capture_marker(),
     })
 }
 
 fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     let backend = backend::detect(settings.backend.as_deref())?;
+
+    if !settings.quiet {
+        if let Some(why) = state::unusable_reason() {
+            eprintln!(
+                "tcap: cannot use the state directory ({why}).\n\
+                 \x20 Continuing without command history: no exit codes, and the check\n\
+                 \x20 that stops a capture returning tcap's own output is off."
+            );
+        }
+    }
+
     let records = state::load();
     let mode = settings.mode;
     let raw = mode == cli::Mode::Raw;
@@ -108,7 +167,12 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         let rec = state::nth_from_end(&records, index);
 
         match backend.fetch(index, rec, raw) {
-            Ok(fetched) => caps.push(build_capture(fetched, rec, backend.name())),
+            Ok(fetched) => caps.push(build_capture(
+                fetched,
+                rec,
+                backend.name(),
+                !backend.has_command_boundaries(),
+            )),
             // The block the user explicitly asked for must report its error.
             // Extra blocks requested via -C are best-effort: running out of
             // history is normal and should not fail the whole capture.
@@ -124,12 +188,42 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         ));
     }
 
+    // Only the marker, deliberately — not `is_capture_record`. The two answer
+    // different questions: indexing asks "was this a tcap run at all", which the
+    // text heuristic approximates well enough; this asks "is tcap's own text the
+    // last thing on screen", true only when the capture actually displayed. A
+    // redirected `tcap --output > notes.txt` printed nothing to the terminal, so
+    // the screen's last output is still a real command's and the next capture is
+    // perfectly valid.
+    let after_tcap = records.last().map(|r| r.was_capture).unwrap_or(false);
+
+    // Refuse rather than emit, in the one case where the output is known to be
+    // wrong: a boundary-less backend returns the last non-empty output, and
+    // after a previous tcap that is the previous capture. Printing it first and
+    // warning afterwards is no use in `tcap --output | some-service`, where the
+    // text has already left by the time stderr is read. Where the mismatch is
+    // only possible rather than certain, the capture proceeds and is labelled.
+    if after_tcap && caps.iter().any(|c| c.approximate) && mode != cli::Mode::Command {
+        return Err(anyhow!(
+            "refusing to capture: the previous command left tcap's own output on screen,\n\
+             and {} can only report the last non-empty output — which is that text, not\n\
+             a command's. (It may have been tcap directly, or a script that called it.)\n\n\
+             Re-run the command you want to capture, then tcap. Inside tmux this is not\n\
+             a limitation, because the shell hook records exact boundaries.",
+            backend.name()
+        ));
+    }
+
     render::prepare(&mut caps, mode, &cli.select, settings.max_bytes);
     let text = render::render(&caps, mode);
 
     println!("{text}");
+    mark_if_stdout_is_terminal();
 
     if !settings.quiet {
+        // Not marked: a one-line diagnostic is not the captured text this guard
+        // is about. Marking it made `tcap --output | llm` refuse the *next*
+        // capture — and flipped that outcome on whether --quiet was passed.
         emit_hints(&caps, backend.as_ref(), mode);
     }
 
@@ -142,14 +236,34 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
 
 /// Warn about degraded captures, naming the cause and the fix. Goes to stderr
 /// so `tcap | sgpt` still pipes clean text.
-fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) {
+/// Returns whether anything was printed.
+fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode) -> bool {
+    let mut printed = false;
+    // Every mode but Command: --output and --raw are the ones piped into another
+    // tool, so they are where handing over an earlier command's text does the
+    // most damage. Command mode renders the shell's own record, which is exact,
+    // and never prints the terminal text this warning is about.
+    //
+    // The *certain* mismatch — a capture straight after another one — does not
+    // reach here at all; capture_and_print refuses it outright.
+    if mode != cli::Mode::Command && caps.iter().any(|c| c.approximate) {
+        eprintln!(
+            "tcap: {} returns the last non-empty output, which may not belong to the\n\
+             \x20 command named above — a silent command yields an earlier one's output,\n\
+             \x20 and a previous `tcap | …` leaves its pipeline's. tmux records exact\n\
+             \x20 boundaries; --quiet silences this.",
+            backend.name()
+        );
+        printed = true;
+    }
+
     // Only the annotated view promises metadata, so only it can disappoint.
     if mode != cli::Mode::Annotated {
-        return;
+        return printed;
     }
 
     if caps.iter().any(Capture::has_metadata) {
-        return;
+        return printed;
     }
 
     let shell = detect_shell();
@@ -177,6 +291,8 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode)
             backend.name()
         );
     }
+
+    true
 }
 
 fn detect_shell() -> String {
@@ -190,8 +306,14 @@ fn detect_shell() -> String {
 /// The shell record wins where both have a value — it saw the command as typed
 /// and is the only source of duration. Backend metadata fills the gaps, which is
 /// what makes iTerm2 usable with no shell integration at all.
-fn build_capture(fetched: backend::Fetched, rec: Option<&Record>, source: &str) -> Capture {
+fn build_capture(
+    fetched: backend::Fetched,
+    rec: Option<&Record>,
+    source: &str,
+    approximate: bool,
+) -> Capture {
     let mut cap = Capture::new(fetched.output, source);
+    cap.approximate = approximate;
 
     cap.command = fetched.command;
     cap.exit_code = fetched.exit_code;

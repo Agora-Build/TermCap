@@ -84,6 +84,8 @@ tcap --output         # output only, no header
 tcap --command        # the command text only
 tcap --raw            # verbatim, ANSI colour intact
 tcap --json           # {command, exit_code, cwd, duration_ms, output, source}
+                      # plus "approximate": true when the backend cannot vouch
+                      # that the output belongs to that command
 tcap --copy           # also copy to the clipboard
 tcap --max-bytes 8000 # elide the middle to fit a smaller context window
 ```
@@ -96,17 +98,23 @@ unrelated jobs.
 | Terminal | Last command | Older (`-c 2`) | Needs |
 |---|---|---|---|
 | **tmux** | yes | **yes** | nothing |
-| **kitty** | yes | no | `allow_remote_control yes` |
+| **kitty** | yes | no | remote control: `yes`, or `socket-only` + `listen_on` |
 | **iTerm2** | yes | no | Shell Integration + `pip install iterm2` |
 | **WezTerm** | not yet | no | run inside tmux |
 | Ghostty, Terminal.app, Alacritty | no | no | run inside tmux |
 
 Two things worth knowing up front:
 
-**Only tmux can reach past the most recent command.** kitty exposes a
-`last_cmd_output` extent and nothing older; iTerm2 exposes only its latest
-prompt. So `tcap -c 2` fails there with a pointer to tmux rather than quietly
-returning the wrong block.
+**Only tmux can reach past the most recent command.** kitty exposes only the
+latest output and nothing older; iTerm2 exposes only its latest prompt. So `tcap
+-c 2` fails there with a pointer to tmux rather than quietly returning the wrong
+block.
+
+**On kitty, output is the last *non-empty* output**, because kitty counts the
+running `tcap` as the current command. A command that printed nothing therefore
+yields an older output under the current header; it is labelled with a `# note:`
+line and `"approximate": true` in `--json`. Two `tcap` runs in a row are a hard
+error instead, since the mismatch is certain there. tmux has no such ambiguity.
 
 **tmux wins whenever it's running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's rendered viewport rather than the shell's real

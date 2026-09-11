@@ -49,17 +49,19 @@ impl ITerm2 {
         Self
     }
 
-    /// Materialise the shim next to our state so we are not re-writing it into
-    /// a world-writable temp path on every call.
+    /// Materialise the shim under the state directory.
+    ///
+    /// Goes through the same ownership-checked, `O_NOFOLLOW` path as every other
+    /// state file. This one matters more than most: the file is handed straight
+    /// to `python3`, so a symlink or a pre-created file here would be code
+    /// execution, not just a truncated file.
     fn shim_path() -> Result<std::path::PathBuf> {
-        let dir = crate::state::state_dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("iterm2_capture.py");
-        let stale = std::fs::read_to_string(&path)
+        let path = crate::state::state_dir().join("iterm2_capture.py");
+        let stale = crate::state::secure_read_file(&path)
             .map(|existing| existing != SHIM)
             .unwrap_or(true);
         if stale {
-            std::fs::write(&path, SHIM)?;
+            crate::state::secure_write(&path, SHIM.as_bytes())?;
         }
         Ok(path)
     }
@@ -106,6 +108,15 @@ impl ITerm2 {
 impl Backend for ITerm2 {
     fn name(&self) -> &'static str {
         "iterm2"
+    }
+
+    /// Assumed, not verified. `async_get_last_prompt` may resolve to the prompt
+    /// tcap is itself running under — the same trap that made kitty's
+    /// `last_cmd_output` return tcap's own empty output — in which case this
+    /// should be `false` and captures should be labelled approximate. Nobody has
+    /// run this backend; `tcap doctor` under iTerm2 is what would settle it.
+    fn has_command_boundaries(&self) -> bool {
+        true
     }
 
     fn fetch(&self, index: usize, _rec: Option<&Record>, raw: bool) -> Result<Fetched> {
