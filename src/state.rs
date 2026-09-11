@@ -7,11 +7,12 @@
 //! JSON Lines: appending keeps the hook cheap, and compaction past
 //! [`COMPACT_AT`] bounds the file in a long-lived shell.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 /// Records retained when the log is compacted. Must comfortably exceed the
 /// largest `-n`/`-c` anyone would plausibly type.
@@ -53,8 +54,7 @@ fn marker_path() -> PathBuf {
 }
 
 pub fn mark_capture() {
-    let _ = fs::create_dir_all(state_dir());
-    let _ = fs::write(marker_path(), b"1");
+    let _ = secure_open(&marker_path()).map(|mut f| f.write_all(b"1"));
 }
 
 /// Whether a capture happened during this command, clearing the marker.
@@ -72,12 +72,52 @@ pub fn state_dir() -> PathBuf {
     base.join(format!("tcap-{}", current_uid()))
 }
 
-/// Avoids a `libc` dependency for a single call.
 fn current_uid() -> u32 {
-    extern "C" {
-        fn getuid() -> u32;
+    // Safe: getuid cannot fail and touches no memory we own.
+    unsafe { libc::getuid() }
+}
+
+/// The state directory, created 0700 and checked to be ours.
+///
+/// The paths under it are predictable, and on Linux the fallback is the shared
+/// /tmp. Without this, another local user could pre-create the directory and
+/// leave a symlink where a state file goes: an ordinary write would then follow
+/// it and truncate whatever it pointed at. macOS is not exposed (TMPDIR is
+/// already per-user) but the check is cheap and the fallback is not.
+fn ensure_state_dir() -> Result<PathBuf> {
+    let dir = state_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("securing {}", dir.display()))?;
+
+    // symlink_metadata, so a symlink in place of the directory is caught rather
+    // than followed.
+    let md = fs::symlink_metadata(&dir)?;
+    if !md.is_dir() {
+        return Err(anyhow!("{} is not a directory", dir.display()));
     }
-    unsafe { getuid() }
+    if md.uid() != current_uid() {
+        return Err(anyhow!(
+            "{} is owned by uid {}, not you — refusing to use it",
+            dir.display(),
+            md.uid()
+        ));
+    }
+    Ok(dir)
+}
+
+/// Open a state file for writing without following symlinks.
+fn secure_open(path: &Path) -> Result<fs::File> {
+    ensure_state_dir()?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        // The whole point: a symlink here fails instead of being followed.
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 /// Identify the current terminal session.
@@ -112,9 +152,7 @@ pub fn log_path() -> PathBuf {
 
 /// Append one record, compacting the log if it has grown too long.
 pub fn append(rec: &Record) -> Result<()> {
-    let dir = state_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("creating state directory {}", dir.display()))?;
+    ensure_state_dir()?;
 
     let path = log_path();
     let line = serde_json::to_string(rec)?;
@@ -122,6 +160,8 @@ pub fn append(rec: &Record) -> Result<()> {
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     writeln!(f, "{line}")?;
@@ -142,7 +182,7 @@ fn compact_if_needed(path: &PathBuf) -> Result<()> {
     let kept = &lines[lines.len() - KEEP..];
     // Write via a temp file so a concurrent reader never sees a partial log.
     let tmp = path.with_extension("jsonl.tmp");
-    fs::write(&tmp, format!("{}\n", kept.join("\n")))?;
+    secure_open(&tmp)?.write_all(format!("{}\n", kept.join("\n")).as_bytes())?;
     fs::rename(&tmp, path)?;
     Ok(())
 }

@@ -20,10 +20,32 @@ use cli::{Cli, RecordArgs, ShellKind, Sub};
 use state::Record;
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("tcap: {e:#}");
+    let failed = match run() {
+        Ok(()) => false,
+        Err(e) => {
+            eprintln!("tcap: {e:#}");
+            true
+        }
+    };
+
+    // Whatever tcap just wrote to the terminal — a capture, a warning, or an
+    // error — is now the screen's last non-empty output, which is what a
+    // boundary-less backend would hand back next time. Marking only the
+    // successful stdout path left the warnings and errors unaccounted for, and
+    // `tcap --output | svc` still prints its warning to the tty.
+    //
+    // The record hook is excluded: it prints nothing.
+    if !matches!(std::env::args().nth(1).as_deref(), Some("__record")) && wrote_to_terminal() {
+        state::mark_capture();
+    }
+
+    if failed {
         std::process::exit(1);
     }
+}
+
+fn wrote_to_terminal() -> bool {
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
 }
 
 fn run() -> Result<()> {
@@ -160,14 +182,6 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
     let text = render::render(&caps, mode);
 
     println!("{text}");
-
-    // Only when the text actually reached the screen. Under `tcap --output >
-    // notes.txt` or `| pbcopy` nothing new is displayed, so marking would make
-    // the next capture refuse for a collision that never happened — in exactly
-    // the piping workflows the README leads with.
-    if std::io::stdout().is_terminal() {
-        state::mark_capture();
-    }
 
     if !settings.quiet {
         emit_hints(&caps, backend.as_ref(), mode);
