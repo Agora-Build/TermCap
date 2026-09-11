@@ -157,15 +157,28 @@ fn emit_hints(caps: &[Capture], backend: &dyn backend::Backend, mode: cli::Mode,
     // Backends without real command boundaries return the last *non-empty*
     // output. tcap's own output is non-empty, so a capture straight after
     // another one hands back the previous capture rather than a command.
-    if after_tcap && !backend.has_command_boundaries() {
-        eprintln!(
-            "tcap: the previous command was tcap itself, and {} can only report the\n\
-             \x20 last non-empty output — so this is most likely the previous capture's\n\
-             \x20 own output, or whatever its pipeline printed, rather than a command's.\n\
-             \x20 Re-run the command you meant to capture, or use tmux, which records\n\
-             \x20 exact boundaries.",
-            backend.name()
-        );
+    // Every mode, not just annotated: --output and --raw are the ones piped
+    // into another tool, so they are exactly where silently handing over an
+    // earlier command's text does the most damage. stderr keeps the pipe clean,
+    // and --quiet still silences it.
+    if caps.iter().any(|c| c.approximate) {
+        if after_tcap {
+            eprintln!(
+                "tcap: the previous command was tcap itself, and {} can only report the\n\
+                 \x20 last non-empty output — so this is most likely the previous capture's\n\
+                 \x20 own output, or whatever its pipeline printed, rather than a command's.\n\
+                 \x20 Re-run the command you meant to capture, or use tmux, which records\n\
+                 \x20 exact boundaries.",
+                backend.name()
+            );
+        } else {
+            eprintln!(
+                "tcap: {} returns the last non-empty output, so if the command named above\n\
+                 \x20 printed nothing this is an earlier command's output. tmux records\n\
+                 \x20 exact boundaries; --quiet silences this.",
+                backend.name()
+            );
+        }
     }
 
     // Only the annotated view promises metadata, so only it can disappoint.

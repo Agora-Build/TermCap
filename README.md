@@ -168,7 +168,9 @@ thing to print. The annotated header carries a `# note:` line saying so, and `--
 `"approximate": true`. tmux has no such
 ambiguity, because the shell hook records real boundaries. kitty also
 needs remote control reachable — either `allow_remote_control yes`, or
-`socket-only` together with `listen_on unix:/tmp/kitty-{kitty_pid}`.
+`socket-only` with a `listen_on` socket in a directory only you can open
+(`${TMPDIR}` on macOS, `${XDG_RUNTIME_DIR}` on Linux). A socket in `/tmp` is
+reachable by anyone with write permission on it.
 
 When something is missing, `tcap` says what and why:
 

@@ -92,6 +92,16 @@ impl Kitty {
     /// answers: telling a `socket-only` user to set `yes` is wrong advice, and
     /// its real cause — no socket to talk to — is not obvious from kitty's
     /// message alone.
+    /// The socket recommendation, given once so the three places that offer it
+    /// cannot drift apart — and correct per platform: `$XDG_RUNTIME_DIR` is a
+    /// systemd convention, normally unset on macOS, where it would expand to
+    /// nothing and leave the socket at the filesystem root.
+    const SOCKET_ADVICE: &'static str = "  allow_remote_control socket-only\n  \
+         listen_on unix:${TMPDIR}/kitty-{kitty_pid}      # macOS: $TMPDIR is per-user, 0700\n  \
+         listen_on unix:${XDG_RUNTIME_DIR}/kitty-{kitty_pid}   # Linux\n\
+         Put it somewhere only you can open. A socket in /tmp is reachable by anyone with \
+         write permission on it, which under a group-writable umask is more than just you.";
+
     fn remote_control_hint(err: &anyhow::Error, listen_on: &Option<String>) -> String {
         let msg = err.to_string().to_lowercase();
 
@@ -101,13 +111,16 @@ impl Kitty {
         // point we already know it is a remote-control failure.
         if msg.contains("socket") {
             return match listen_on {
-                None => "kitty is set to `allow_remote_control socket-only`, but \
-                     $KITTY_LISTEN_ON is unset, so there is no socket to use.\n\
-                     Add to ~/.config/kitty/kitty.conf and restart kitty:\n  \
-                     listen_on unix:/tmp/kitty-{kitty_pid}\n\
+                // "socket" is one word out of kitty's message, so this is an
+                // inference, not a reading of the config — hedged accordingly.
+                None => format!(
+                    "This looks like `allow_remote_control socket-only` with \
+                     $KITTY_LISTEN_ON unset, leaving no socket to use.\n\
+                     Add to ~/.config/kitty/kitty.conf and restart kitty:\n{}\n\
                      If it is set in your shell but not here, something in between is \
-                     clearing the environment."
-                    .to_string(),
+                     clearing the environment.",
+                    Self::SOCKET_ADVICE
+                ),
                 Some(sock) => format!(
                     "the socket at {sock} was refused. Restart kitty so the running \
                      instance and $KITTY_LISTEN_ON agree."
@@ -120,25 +133,23 @@ impl Kitty {
             // remove authentication from the one call that dumps terminal
             // contents, for every process that can reach the socket, to work
             // around tcap's own limitation. Better to be unsupported.
-            return "kitty is requiring a remote-control password, which tcap cannot send, \
-                 so this setup is unsupported.\n\
+            return format!(
+                "kitty is requiring a remote-control password, which tcap cannot send, so \
+                 this setup is unsupported.\n\
                  Rather than weaken authentication for `get-text` — which returns whatever \
                  is on screen, credentials included — run inside tmux, which needs no kitty \
-                 remote control at all. If you would rather use a socket, put it somewhere \
-                 only you can open, such as a directory of your own with mode 0700:\n  \
-                 allow_remote_control socket-only\n  \
-                 listen_on unix:${XDG_RUNTIME_DIR}/kitty-{kitty_pid}\n\
-                 A socket in /tmp is reachable by anyone with write permission on it, which \
-                 under a group-writable umask is more than just you."
-                .to_string();
+                 remote control at all. If you would rather use a socket:\n{}",
+                Self::SOCKET_ADVICE
+            );
         }
 
-        "If this is a remote-control problem, kitty needs it enabled. In \
-         ~/.config/kitty/kitty.conf either:\n  allow_remote_control yes\nor keep it \
-         restricted and give tcap a socket:\n  allow_remote_control socket-only\n  \
-         listen_on unix:/tmp/kitty-{kitty_pid}\nThen restart kitty. If the message above \
-         says something else, that is the real cause."
-            .to_string()
+        format!(
+            "If this is a remote-control problem, kitty needs it enabled. In \
+             ~/.config/kitty/kitty.conf either:\n  allow_remote_control yes\nor keep it \
+             restricted and give tcap a socket:\n{}\nThen restart kitty. If the message \
+             above says something else, that is the real cause.",
+            Self::SOCKET_ADVICE
+        )
     }
 
     /// `--match id:N` for the window tcap is running in.
@@ -278,10 +289,14 @@ impl Backend for Kitty {
                 if reachable {
                     let probe = self.get_text_args(&listen_on, &w, false);
                     d.push(match run(&self.exe, &probe) {
+                        // Empty is also what a brand-new window returns, so this
+                        // must not call a healthy setup broken — doctor is only
+                        // useful if its verdicts can be trusted.
                         Ok(t) if t.trim().is_empty() => Diagnostic::bad(
                             "shell integration",
-                            "the extent resolved but returned nothing — kitty's own shell \
-                             integration is probably off (`shell_integration enabled`)",
+                            "no output to read yet. Run a command that prints something and \
+                             re-run doctor; if it is still empty, check `shell_integration` \
+                             in kitty.conf",
                         ),
                         Ok(_) => {
                             Diagnostic::ok("shell integration", "last_non_empty_output resolves")
