@@ -9,6 +9,7 @@ mod doctor;
 mod render;
 mod state;
 
+use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -130,12 +131,14 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
         ));
     }
 
-    // Unfiltered: nth_from_end skips captures, but here we need to know whether
-    // the most recent command *was* one.
-    let after_tcap = records
-        .last()
-        .map(state::is_capture_record)
-        .unwrap_or(false);
+    // Only the marker, deliberately — not `is_capture_record`. The two answer
+    // different questions: indexing asks "was this a tcap run at all", which the
+    // text heuristic approximates well enough; this asks "is tcap's own text the
+    // last thing on screen", true only when the capture actually displayed. A
+    // redirected `tcap --output > notes.txt` printed nothing to the terminal, so
+    // the screen's last output is still a real command's and the next capture is
+    // perfectly valid.
+    let after_tcap = records.last().map(|r| r.was_capture).unwrap_or(false);
 
     // Refuse rather than emit, in the one case where the output is known to be
     // wrong: a boundary-less backend returns the last non-empty output, and
@@ -158,9 +161,13 @@ fn capture_and_print(cli: &Cli, settings: &cli::Settings) -> Result<()> {
 
     println!("{text}");
 
-    // Marked after emitting: the next command's hook collects this, so a
-    // following capture knows the screen's last output is ours.
-    state::mark_capture();
+    // Only when the text actually reached the screen. Under `tcap --output >
+    // notes.txt` or `| pbcopy` nothing new is displayed, so marking would make
+    // the next capture refuse for a collision that never happened — in exactly
+    // the piping workflows the README leads with.
+    if std::io::stdout().is_terminal() {
+        state::mark_capture();
+    }
 
     if !settings.quiet {
         emit_hints(&caps, backend.as_ref(), mode);

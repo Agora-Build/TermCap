@@ -203,7 +203,7 @@ pub fn nth_from_end(records: &[Record], n: usize) -> Option<&Record> {
     records
         .iter()
         .rev()
-        .filter(|r| !is_tcap_invocation(&r.command))
+        .filter(|r| !is_capture_record(r))
         .nth(n.saturating_sub(1))
 }
 
@@ -284,6 +284,19 @@ mod tests {
         assert_eq!(nth_from_end(&records, 1).unwrap().command, "ls");
         assert_eq!(nth_from_end(&records, 2).unwrap().command, "npm run build");
         assert!(nth_from_end(&records, 3).is_none());
+    }
+
+    /// An aliased capture has no tcap in its text, so only `was_capture` keeps
+    /// it from being indexed as a real command — which would pair its metadata
+    /// with unrelated output, on tmux as much as kitty.
+    #[test]
+    fn nth_skips_captures_made_through_an_alias() {
+        let mut aliased = rec("t");
+        aliased.was_capture = true;
+        let records = vec![rec("npm run build"), rec("ls"), aliased];
+
+        assert_eq!(nth_from_end(&records, 1).unwrap().command, "ls");
+        assert_eq!(nth_from_end(&records, 2).unwrap().command, "npm run build");
     }
 
     #[test]

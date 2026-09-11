@@ -111,9 +111,10 @@ latest output and nothing older; iTerm2 exposes only its latest prompt. So `tcap
 block.
 
 **On kitty, output is the last *non-empty* output**, because kitty counts the
-running `tcap` as the current command. So a command that printed nothing, or two
-`tcap` runs in a row, yields an older output under the current header. The header carries a `# note:` line saying so, and `--json` sets
-`"approximate": true`; tmux has no such ambiguity.
+running `tcap` as the current command. A command that printed nothing therefore
+yields an older output under the current header; it is labelled with a `# note:`
+line and `"approximate": true` in `--json`. Two `tcap` runs in a row are a hard
+error instead, since the mismatch is certain there. tmux has no such ambiguity.
 
 **tmux wins whenever it's running.** Inside kitty running tmux, asking kitty for
 its scrollback returns tmux's rendered viewport rather than the shell's real

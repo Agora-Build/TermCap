@@ -162,10 +162,10 @@ wrong block.
 **On kitty, output is the last *non-empty* output.** kitty counts the running
 `tcap` as the current command, so it has to be asked for the last output that
 wasn't empty. The consequence: if your last command printed nothing, kitty
-returns an *older* command's output while the header names the last one — and two
-`tcap` runs in a row return the first run's own output, since that was the last
-thing to print. The annotated header carries a `# note:` line saying so, and `--json` sets
-`"approximate": true`. tmux has no such
+returns an *older* command's output while the header names the last one. The
+annotated header carries a `# note:` line saying so, and `--json` sets
+`"approximate": true`. Two `tcap` runs in a row are a **hard error** rather than
+a label, since there the mismatch is certain. tmux has no such
 ambiguity, because the shell hook records real boundaries. kitty also
 needs remote control reachable — either `allow_remote_control yes`, or
 `socket-only` with a `listen_on` socket in a directory only you can open

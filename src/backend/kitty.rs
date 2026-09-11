@@ -118,17 +118,24 @@ impl Kitty {
 
         let line = match &dir {
             Some(d) => format!("  listen_on unix:{d}/kitty-{{kitty_pid}}"),
-            None => "  listen_on unix:/run/user/$(id -u)/kitty-{kitty_pid}   <- or any \
-                 directory only you can open; $XDG_RUNTIME_DIR is unset here"
-                .to_string(),
+            // Still one paste-safe line: kitty.conf does no command
+            // substitution either, so `$(id -u)` would stay literal. The caveat
+            // belongs in the prose below, not on the line itself.
+            None => "  listen_on unix:/run/user/1000/kitty-{kitty_pid}".to_string(),
         };
 
         format!(
-            "  allow_remote_control socket-only\n{line}\n\
+            "  allow_remote_control socket-only\n{line}\n{note}\
              Keep the socket in a directory only you can open. One in /tmp is reachable by \
              anyone with write permission on it, which under a group-writable umask is more \
-             than just you. Note kitty.conf has no trailing comments: everything after the \
-             value is part of it."
+             than just you. Note kitty.conf has no trailing comments and no command \
+             substitution: everything after the value is part of it, literally.",
+            note = if dir.is_none() {
+                "$XDG_RUNTIME_DIR is unset here, so the path above is a guess — replace 1000 \
+                 with your uid, or use any directory only you can open.\n"
+            } else {
+                ""
+            }
         )
     }
 
